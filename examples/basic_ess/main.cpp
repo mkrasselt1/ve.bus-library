@@ -118,10 +118,22 @@ static void vebusTaskFn(void *param)
             }
         }
 
-        // --- 4. Watchdog / no-sync alert -----------------------------------
+        // --- 4. No-sync watchdog with automatic wakeup recovery ------------
+        //
+        // If the Multiplus stops sending sync frames for > 1 s it is likely
+        // sleeping.  Send a wakeup command every WAKEUP_RETRY_MS until sync
+        // resumes.  isSynced() becoming true again means the device is back.
         if (vebus.hasNoSync())
         {
-            Serial.println("[VEBus] WARNING: no sync from Multiplus!");
+            static unsigned long lastWakeupAttemptMs = 0;
+            const unsigned long WAKEUP_RETRY_MS = 3000;
+
+            if (millis() - lastWakeupAttemptMs >= WAKEUP_RETRY_MS)
+            {
+                lastWakeupAttemptMs = millis();
+                vebus.sendWakeup();
+                Serial.println("[VEBus] No sync — sent wakeup, retrying...");
+            }
         }
 
         // Yield to other tasks for 1 ms — keeps CPU use reasonable while
