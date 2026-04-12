@@ -39,13 +39,50 @@ The setpoint controls power exchange on the **AC-IN (grid) side**, not AC-OUT:
 
 ## Hardware — LilyGo T-CAN485
 
-| Signal | GPIO |
-|--------|------|
-| RS485 RX | 21 |
-| RS485 TX | 22 |
-| RS485 DE | 17 |
+The T-CAN485 uses a **MAX13487E** RS485 transceiver with auto-direction
+(no DE pin — the driver enables automatically when data is sent).
 
-Wiring to Multiplus: connect **A (+)** and **B (−)** RS485 lines and share **GND**.
+| Signal | GPIO | MAX13487E Pin |
+|--------|------|---------------|
+| RS485 RX | 21 | RO (pin 1) |
+| RS485 TX | 22 | DI (pin 4) |
+| /RE (receiver enable) | 17 | /RE (pin 2) — active-low, used as RTS |
+| /SHDN (shutdown) | 19 | /SHDN (pin 3) — **must be driven HIGH!** |
+
+> **Important:** GPIO 19 controls the transceiver shutdown pin. If left
+> floating or driven LOW, the transceiver is completely off (no RX or TX).
+> The example calls `digitalWrite(19, HIGH)` in `setup()` before
+> `vebus.begin()`.
+
+### Hardware modification required
+
+The T-CAN485 has **100pF capacitors (C9, C11)** and a **common-mode choke
+(L2)** on the RS485 A/B lines. These are designed for typical Modbus speeds
+(9600–19200 baud) but can cause signal integrity issues at the VE.Bus baud
+rate of **256000 baud**.
+
+**Remove the following components** near the RS485 transceiver for reliable
+operation at 256 kbaud:
+
+- **C9** (100pF) — on the B line
+- **C11** (100pF) — on the A line
+- **L2** (SDCW3225S-2-102TF, common-mode choke) — between transceiver and connector
+
+The 120Ω termination resistor (R6) and TVS protection diodes can stay.
+
+### Wiring
+
+Connect **3 wires** between the T-CAN485 screw terminals and the Multiplus
+VE.Bus RJ45 connector:
+
+| T-CAN485 | Multiplus VE.Bus RJ45 |
+|----------|-----------------------|
+| A | Pin 3 (Data+) |
+| B | Pin 4 (Data−) |
+| GND | Pin 5 (GND) |
+
+> **RS485 requires a ground connection.** Without GND the common-mode voltage
+> drifts and the receiver reads noise.
 
 ## Quick Start
 
@@ -55,22 +92,22 @@ Wiring to Multiplus: connect **A (+)** and **B (−)** RS485 lines and share **G
 VEBus vebus;
 
 void setup() {
-    vebus.begin(21, 22, 17);   // RX, TX, DE — LilyGo T-CAN485
+    pinMode(19, OUTPUT);
+    digitalWrite(19, HIGH);      // enable MAX13487E (/SHDN HIGH)
+    vebus.begin(21, 22, 17);    // RX, TX, /RE — LilyGo T-CAN485
 }
 
 void loop() {
-    vebus.handle();
-
-    if (vebus.isSynced() && millis() >= vebus.getSyncTime() + 8) {
-        vebus.clearSync();
-        vebus.sendESSPower(300);   // push 300 W from battery toward grid
-    }
+    // Queue commands — the library sends them at the right time
+    vebus.setESSPower(300);      // push 300 W from battery toward grid
+    vebus.requestReadRAM();      // request battery voltage + AC power
 
     if (vebus.hasNewData()) {
         vebus.clearNewData();
         Serial.printf("Bat: %.2f V  AC: %d W\n",
                       vebus.getBatVolt(), vebus.getACPower());
     }
+    delay(5000);
 }
 ```
 
