@@ -149,12 +149,25 @@ void loop()
         Serial.println();
     }
 
-    // --- Serial Monitor: type a wattage and press Enter ---
+    // --- Serial Monitor commands ---
+    // Type a number + Enter → set ESS power (e.g. "300" or "-500")
+    // Type "w" + Enter      → wake up Multiplus
+    // Type "s" + Enter      → sleep Multiplus
     if (Serial.available())
     {
         String input = Serial.readStringUntil('\n');
         input.trim();
-        if (input.length() > 0)
+        if (input.equalsIgnoreCase("w"))
+        {
+            vebus.requestWakeup();
+            Serial.println("[app] Wakeup sent");
+        }
+        else if (input.equalsIgnoreCase("s"))
+        {
+            vebus.requestSleep();
+            Serial.println("[app] Sleep sent");
+        }
+        else if (input.length() > 0)
         {
             int16_t newPower = (int16_t)input.toInt();
             newPower = constrain(newPower, -1875, 1875);

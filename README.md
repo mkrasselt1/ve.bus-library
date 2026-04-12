@@ -19,13 +19,12 @@ start there.
 
 ## Features
 
-- RS485 half-duplex UART init (ESP32 hardware RS485 mode)
-- Sync frame detection with rolling frame-number tracking
-- Send **ESS power setpoint** (`sendESSPower`)
-- Send **sleep / wakeup** commands
-- Request **battery voltage + AC power** via RAM read (`sendReadRAM`)
-- Decode charger/inverter status, LED bitmask, DC current, temperature, AC input limits
-- No internal RTOS task — call `handle()` from your own loop or task
+- Internal FreeRTOS task handles all RS485 RX/TX with correct sync timing
+- Thread-safe command queue — call `setESSPower()` etc. from any core
+- ESS power setpoint, sleep/wakeup commands, RAM variable reads
+- Decodes charger/inverter status, LED bitmask, DC current, temperature, AC input limits
+- Auto-direction support for MAX13487E transceiver (no DE pin needed)
+- Automatic no-sync recovery with wakeup retry (in the example)
 
 ## ESS Setpoint Semantics
 
@@ -112,7 +111,15 @@ void loop() {
 ```
 
 See [`examples/basic_ess/main.cpp`](examples/basic_ess/main.cpp) for a full
-dual-core FreeRTOS example with automatic no-sync recovery.
+example with automatic no-sync recovery and serial console commands:
+
+| Serial input | Action |
+|-------------|--------|
+| `w` | Wake up Multiplus |
+| `s` | Sleep Multiplus |
+| `300` | Set ESS to +300 W (invert) |
+| `-500` | Set ESS to −500 W (charge) |
+| `0` | Standby |
 
 ## PlatformIO
 
@@ -132,35 +139,29 @@ lib_extra_dirs = .
 
 ### Initialisation
 ```cpp
-void begin(int rxPin, int txPin, int dePin, uint32_t baud = 256000);
+// Starts UART and launches internal task on the specified core (default: 0)
+void begin(int rxPin, int txPin, int dePin, int core = 0);
 ```
 
-### Main loop
+### Thread-safe commands (call from any core/task)
 ```cpp
-void handle();   // call as often as possible
-```
-
-### TX commands (call after isSynced())
-```cpp
-void sendESSPower(int16_t watts);
-void sendReadRAM();
-void sendSleep();
-void sendWakeup();
+void setESSPower(int16_t watts);  // queue ESS power setpoint
+void requestReadRAM();            // request battery voltage + AC power
+void requestSleep();              // put Multiplus to sleep
+void requestWakeup();             // wake Multiplus from sleep
 ```
 
 ### Status
 ```cpp
-bool          isSynced();
-unsigned long getSyncTime();
-void          clearSync();
-bool          hasNoSync();        // no sync frame for > 1 s
-bool          hasNewData();       // RAM read response arrived
-void          clearNewData();
-bool          isAcked();
-uint32_t      getChecksumFaults();
+bool     hasNoSync();        // no sync frame for > 1 s
+bool     hasNewData();       // RAM read response arrived
+void     clearNewData();
+bool     isAcked();          // last ESS command was acknowledged
+void     clearAcked();
+uint32_t getChecksumFaults();
 ```
 
-### Decoded data
+### Decoded data (safe to read from any core)
 ```cpp
 float   getBatVolt();             // battery voltage [V]
 int16_t getACPower();             // AC power [W]  positive = inverting
@@ -174,6 +175,7 @@ bool    dcLevelAllowsInverting();
 float   getMinInputCurrentLimit();
 float   getMaxInputCurrentLimit();
 float   getActInputCurrentLimit();
+byte    getSwitchRegister();
 ```
 
 ### LED constants
