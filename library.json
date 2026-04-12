@@ -27,7 +27,12 @@
     {
       "name": "Basic ESS",
       "base": "examples/basic_ess",
-      "files": ["src/main.cpp", "platformio.ini"]
+      "files": ["main.cpp"]
+    },
+    {
+      "name": "MQTT Home Assistant",
+      "base": "examples/mqtt_ha",
+      "files": ["main.cpp"]
     }
   ]
 }
