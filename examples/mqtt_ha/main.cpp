@@ -11,20 +11,33 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiManager.h>
+#include <Preferences.h>
 #include <PubSubClient.h>
 #include <VEBus.h>
 
 // =======================================================================
-// Configuration — edit these for your setup
+// Defaults — used the first time the device boots (no NVS entry yet) and
+// pre-fill the captive portal form. After the user saves the portal,
+// values come from NVS and the portal stays live on the device's STA IP
+// at http://<device-ip>/ so you can change them at any time.
 // =======================================================================
-const char *WIFI_SSID     = "YOUR_SSID";
-const char *WIFI_PASS     = "YOUR_PASSWORD";
-const char *MQTT_HOST     = "192.168.1.100";
-const uint16_t MQTT_PORT  = 1883;
-const char *MQTT_USER     = "";          // leave empty if no auth
-const char *MQTT_PASS     = "";
-const char *DEVICE_ID     = "vebus_multiplus";
-const char *TOPIC_PREFIX  = "vebus/multiplus";
+#define DEFAULT_MQTT_HOST     "192.0.2.100"
+#define DEFAULT_MQTT_PORT     "1883"
+#define DEFAULT_MQTT_USER     ""
+#define DEFAULT_MQTT_PASS     ""
+#define DEFAULT_DEVICE_ID     "vebus_multiplus"
+#define DEFAULT_TOPIC_PREFIX  "vebus/multiplus"
+#define AP_SSID               "VEBus-Setup"
+#define AP_PASS               ""    // open AP
+
+// Runtime config (loaded from NVS on boot, written by portal save)
+char     MQTT_HOST[64]    = DEFAULT_MQTT_HOST;
+uint16_t MQTT_PORT        = 1883;
+char     MQTT_USER[32]    = DEFAULT_MQTT_USER;
+char     MQTT_PASS[32]    = DEFAULT_MQTT_PASS;
+char     DEVICE_ID[32]    = DEFAULT_DEVICE_ID;
+char     TOPIC_PREFIX[64] = DEFAULT_TOPIC_PREFIX;
 
 // T-CAN485 pins
 #define VEBUS_PIN_RX   21
@@ -48,6 +61,16 @@ const char *TOPIC_PREFIX  = "vebus/multiplus";
 WiFiClient   wifiClient;
 PubSubClient mqtt(wifiClient);
 VEBus        vebus;
+WiFiManager  wm;
+Preferences  prefs;
+
+// WiFiManager parameter handles (heap so they survive the portal lifetime)
+WiFiManagerParameter *wmpHost      = nullptr;
+WiFiManagerParameter *wmpPort      = nullptr;
+WiFiManagerParameter *wmpUser      = nullptr;
+WiFiManagerParameter *wmpPass      = nullptr;
+WiFiManagerParameter *wmpDeviceId  = nullptr;
+WiFiManagerParameter *wmpTopicPref = nullptr;
 
 volatile int16_t g_essPower = 0;
 
@@ -106,6 +129,51 @@ static const char *chargeSubStateName(uint8_t sub)
     case VEBUS_CHARGE_BULK_STOPPED:        return "Bulk Stopped";
     default:                               return "Unknown";
     }
+}
+
+// =======================================================================
+// Config persistence (NVS via Preferences)
+// =======================================================================
+static void loadConfig()
+{
+    prefs.begin("vebus_mqtt", true);
+    strlcpy(MQTT_HOST,    prefs.getString("host",     DEFAULT_MQTT_HOST).c_str(),    sizeof(MQTT_HOST));
+    MQTT_PORT = (uint16_t)prefs.getUShort("port",     1883);
+    strlcpy(MQTT_USER,    prefs.getString("user",     DEFAULT_MQTT_USER).c_str(),    sizeof(MQTT_USER));
+    strlcpy(MQTT_PASS,    prefs.getString("pass",     DEFAULT_MQTT_PASS).c_str(),    sizeof(MQTT_PASS));
+    strlcpy(DEVICE_ID,    prefs.getString("device",   DEFAULT_DEVICE_ID).c_str(),    sizeof(DEVICE_ID));
+    strlcpy(TOPIC_PREFIX, prefs.getString("prefix",   DEFAULT_TOPIC_PREFIX).c_str(), sizeof(TOPIC_PREFIX));
+    prefs.end();
+}
+
+static void saveConfig()
+{
+    prefs.begin("vebus_mqtt", false);
+    prefs.putString("host",   MQTT_HOST);
+    prefs.putUShort("port",   MQTT_PORT);
+    prefs.putString("user",   MQTT_USER);
+    prefs.putString("pass",   MQTT_PASS);
+    prefs.putString("device", DEVICE_ID);
+    prefs.putString("prefix", TOPIC_PREFIX);
+    prefs.end();
+}
+
+// WiFiManager save callback — copy portal values into globals + NVS, then
+// drop the existing MQTT connection so connectMqtt() picks up the new host.
+static void onPortalSave()
+{
+    strlcpy(MQTT_HOST,    wmpHost->getValue(),      sizeof(MQTT_HOST));
+    MQTT_PORT = (uint16_t)atoi(wmpPort->getValue());
+    if (MQTT_PORT == 0) MQTT_PORT = 1883;
+    strlcpy(MQTT_USER,    wmpUser->getValue(),      sizeof(MQTT_USER));
+    strlcpy(MQTT_PASS,    wmpPass->getValue(),      sizeof(MQTT_PASS));
+    strlcpy(DEVICE_ID,    wmpDeviceId->getValue(),  sizeof(DEVICE_ID));
+    strlcpy(TOPIC_PREFIX, wmpTopicPref->getValue(), sizeof(TOPIC_PREFIX));
+    saveConfig();
+
+    Serial.println("[wm] config saved — reconnecting MQTT");
+    mqtt.disconnect();
+    mqtt.setServer(MQTT_HOST, MQTT_PORT);
 }
 
 // =======================================================================
@@ -215,6 +283,27 @@ void publishButtonConfig(const char *name, const char *uid,
     mqtt.publish(configTopic, payloadBuf, true);
 }
 
+void publishSwitchConfig(const char *name, const char *uid,
+                         const char *stateSuffix, const char *cmdSuffix)
+{
+    char configTopic[128];
+    snprintf(configTopic, sizeof(configTopic),
+             "homeassistant/switch/%s/config", uid);
+
+    int len = snprintf(payloadBuf, sizeof(payloadBuf),
+        "{\"name\":\"%s\",\"uniq_id\":\"%s\","
+        "\"stat_t\":\"%s/%s\","
+        "\"cmd_t\":\"%s/%s/set\","
+        "\"pl_on\":\"ON\",\"pl_off\":\"OFF\","
+        "\"avty_t\":\"%s/status\",",
+        name, uid, TOPIC_PREFIX, stateSuffix,
+        TOPIC_PREFIX, cmdSuffix, TOPIC_PREFIX);
+    snprintf(payloadBuf + len, sizeof(payloadBuf) - len, DEVICE_JSON, DEVICE_ID);
+    strlcat(payloadBuf, "}", sizeof(payloadBuf));
+
+    mqtt.publish(configTopic, payloadBuf, true);
+}
+
 void publishSelectConfig()
 {
     char configTopic[128];
@@ -243,6 +332,7 @@ void publishDiscovery()
     publishSensorConfig("Temperature",      "vebus_temp",         "\xC2\xB0""C", "temperature", "temp");
     publishSensorConfig("Charger Status",   "vebus_charger",      "",   "",            "charger_status");
     publishSensorConfig("ESS Power",        "vebus_ess_state",    "W",  "power",       "ess_power");
+    publishSensorConfig("Effective ESS Power", "vebus_ess_eff",   "W",  "power",       "ess_power_eff");
 
     // --- Sensors: extended RAM batch 1 (AC voltages, currents, power) ---
     publishSensorConfig("Mains Voltage",    "vebus_mains_v",      "V",  "voltage",     "mains_voltage");
@@ -278,6 +368,10 @@ void publishDiscovery()
 
     // --- Select: switch state ---
     publishSelectConfig();
+
+    // --- Switch: battery-neutral UPS / virtual setpoint mode ---
+    publishSwitchConfig("Battery-Neutral UPS Mode", "vebus_virtual_mode",
+                        "virtual_mode", "virtual_mode");
 
     // --- Buttons ---
     publishButtonConfig("Wakeup Multiplus",      "vebus_wakeup",       "wakeup");
@@ -351,6 +445,13 @@ void mqttCallback(char *topicStr, byte *payload, unsigned int length)
         vebus.forceDeviceState(VEBUS_FORCE_EQUALISE);
         Serial.println("[MQTT] Force equalise sent");
     }
+    else if (strstr(topicStr, "virtual_mode/set"))
+    {
+        bool on = (strcasecmp(msg, "ON") == 0 || atoi(msg) != 0);
+        vebus.enableVirtualSetpointMode(on);
+        mqtt.publish(topic("virtual_mode"), on ? "ON" : "OFF", true);
+        Serial.printf("[MQTT] Virtual mode → %s\n", on ? "ON" : "OFF");
+    }
 }
 
 // =======================================================================
@@ -422,6 +523,12 @@ void publishSensors()
 
     snprintf(val, sizeof(val), "%d", (int)g_essPower);
     mqtt.publish(topic("ess_power"), val);
+
+    snprintf(val, sizeof(val), "%d", (int)vebus.getEffectiveESSPower());
+    mqtt.publish(topic("ess_power_eff"), val);
+
+    mqtt.publish(topic("virtual_mode"),
+                 vebus.isVirtualSetpointMode() ? "ON" : "OFF");
 
     // --- Extended RAM batch 1: AC voltages, currents, power ---
     snprintf(val, sizeof(val), "%d", (int)g_mainsVoltage);
@@ -515,16 +622,45 @@ void setup()
     vebus.begin(VEBUS_PIN_RX, VEBUS_PIN_TX, VEBUS_PIN_RE);
     Serial.println("VE.Bus started.");
 
-    // WiFi
-    WiFi.mode(WIFI_STA);
-    WiFi.setAutoReconnect(true);
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
-    Serial.print("WiFi");
-    while (WiFi.status() != WL_CONNECTED) {
-        delay(500);
-        Serial.print(".");
+    // Load persisted MQTT config (defaults on first boot)
+    loadConfig();
+    Serial.printf("[cfg] MQTT=%s:%u user='%s' device='%s' prefix='%s'\n",
+                  MQTT_HOST, MQTT_PORT, MQTT_USER, DEVICE_ID, TOPIC_PREFIX);
+
+    // Build portal parameters from current config
+    char portBuf[8];
+    snprintf(portBuf, sizeof(portBuf), "%u", MQTT_PORT);
+    wmpHost      = new WiFiManagerParameter("host",   "MQTT host",         MQTT_HOST,    63);
+    wmpPort      = new WiFiManagerParameter("port",   "MQTT port",         portBuf,       5);
+    wmpUser      = new WiFiManagerParameter("user",   "MQTT username",     MQTT_USER,    31);
+    wmpPass      = new WiFiManagerParameter("pass",   "MQTT password",     MQTT_PASS,    31);
+    wmpDeviceId  = new WiFiManagerParameter("device", "HA device id",      DEVICE_ID,    31);
+    wmpTopicPref = new WiFiManagerParameter("prefix", "MQTT topic prefix", TOPIC_PREFIX, 63);
+    wm.addParameter(wmpHost);
+    wm.addParameter(wmpPort);
+    wm.addParameter(wmpUser);
+    wm.addParameter(wmpPass);
+    wm.addParameter(wmpDeviceId);
+    wm.addParameter(wmpTopicPref);
+    wm.setSaveParamsCallback(onPortalSave);
+    wm.setConfigPortalBlocking(true);
+    wm.setConfigPortalTimeout(180);
+    wm.setHostname(DEVICE_ID);
+
+    // First boot or no saved WiFi → captive portal AP. Otherwise STA connect.
+    if (!wm.autoConnect(AP_SSID, AP_PASS)) {
+        Serial.println("[wm] autoConnect failed/timed out — rebooting");
+        delay(1000);
+        ESP.restart();
     }
-    Serial.printf(" connected (%s)\n", WiFi.localIP().toString().c_str());
+    Serial.printf("[wifi] connected (%s)\n", WiFi.localIP().toString().c_str());
+
+    // Keep the portal UI live on the device's STA IP so config can be
+    // changed any time without re-flashing.
+    wm.setConfigPortalBlocking(false);
+    wm.startWebPortal();
+    Serial.printf("[wm] config UI live at http://%s/\n",
+                  WiFi.localIP().toString().c_str());
 
     // MQTT
     mqtt.setServer(MQTT_HOST, MQTT_PORT);
@@ -546,6 +682,9 @@ void loop()
     static bool          stateRequested  = false;
 
     unsigned long now = millis();
+
+    // Process WiFiManager web portal requests (non-blocking)
+    wm.process();
 
     // MQTT keepalive + reconnect
     if (!mqtt.connected()) connectMqtt();
@@ -613,6 +752,8 @@ void loop()
             g_inverterCurrent = vebus.getRAMVarValue(3);
             g_outputPower     = vebus.getRAMVarValue(4);
             g_mainsPower      = vebus.getRAMVarValue(5);
+            // Feed AC-out load to virtual setpoint mode
+            vebus.setACOutLoad(g_outputPower);
         }
         else if (g_lastRamBatch == 2 && count >= 4)
         {

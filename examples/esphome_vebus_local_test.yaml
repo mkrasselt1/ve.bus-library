@@ -1,0 +1,85 @@
+# Local-build test config — points external_components at the repo's
+# components/ directory so we compile against the in-tree wrapper instead
+# of pulling from GitHub. Not for end users; see esphome_vebus.yaml for
+# the published config.
+
+esphome:
+  name: vebus-multiplus-test
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+logger:
+  level: INFO
+
+# No api: / wifi: blocks needed for a pure compile check.
+
+output:
+  - platform: gpio
+    pin: GPIO19
+    id: shdn_pin
+
+external_components:
+  - source:
+      type: local
+      path: ../components
+    components: [vebus]
+
+vebus:
+  id: multiplus
+  rx_pin: 21
+  tx_pin: 22
+  de_pin: 17
+  core: 1
+  update_interval: 1s
+  initial_ess_power: 0
+  virtual_mode_initial: false
+  virtual_mode_deadband: 10
+
+sensor:
+  - platform: vebus
+    battery_voltage:
+      name: "Battery V"
+    dc_current:
+      name: "DC A"
+    temperature:
+      name: "Temp"
+    ac_power:
+      name: "AC W"
+    mains_voltage:
+      name: "Mains V"
+    mains_current:
+      name: "Mains A"
+    inverter_voltage:
+      name: "Inv V"
+    inverter_current:
+      name: "Inv A"
+    output_power:
+      name: "AC-Out W"
+    mains_power:
+      name: "Mains W"
+    soc:
+      name: "SoC"
+    effective_ess_power:
+      name: "Eff ESS W"
+    ac_out_load:
+      name: "AC-Out Load"
+
+binary_sensor:
+  - platform: vebus
+    sync:
+      name: "VE.Bus Sync"
+    dc_allows_inverting:
+      name: "DC OK"
+
+number:
+  - platform: vebus
+    ess_power:
+      name: "ESS Setpoint"
+
+switch:
+  - platform: vebus
+    virtual_setpoint_mode:
+      name: "Battery-Neutral UPS"

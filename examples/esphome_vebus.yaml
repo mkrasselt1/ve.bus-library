@@ -1,0 +1,104 @@
+# Sample ESPHome configuration for the LilyGo T-CAN485 with a Victron
+# Multiplus on VE.Bus. Pull the component straight from this repo:
+#
+#   external_components:
+#     - source: github://mkrasselt1/ve.bus-library
+#       components: [vebus]
+#
+# The library runs RS485 I/O in its own FreeRTOS task (pin to core 1 by
+# default — `core: 1` below — so it stays clear of ESPHome's main loop).
+
+esphome:
+  name: vebus-multiplus
+  on_boot:
+    priority: -100
+    then:
+      - output.turn_on: shdn_pin    # MAX13487E /SHDN must be HIGH
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+logger:
+api:
+ota:
+  - platform: esphome
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "VEBus Fallback Hotspot"
+
+captive_portal:
+
+# T-CAN485 hardware: MAX13487E /SHDN on GPIO19 must be tied HIGH for the
+# transceiver to power up at all.
+output:
+  - platform: gpio
+    pin: GPIO19
+    id: shdn_pin
+
+external_components:
+  - source:
+      type: git
+      url: https://github.com/mkrasselt1/ve.bus-library
+      ref: main
+    components: [vebus]
+
+vebus:
+  id: multiplus
+  rx_pin: 21
+  tx_pin: 22
+  de_pin: 17
+  core: 1                       # run the VE.Bus task on core 1
+  update_interval: 1s
+  initial_ess_power: 0
+  virtual_mode_initial: false
+  virtual_mode_deadband: 10
+
+sensor:
+  - platform: vebus
+    battery_voltage:
+      name: "Multiplus Battery Voltage"
+    dc_current:
+      name: "Multiplus DC Current"
+    temperature:
+      name: "Multiplus Temperature"
+    ac_power:
+      name: "Multiplus AC Power"
+    mains_voltage:
+      name: "Multiplus Mains Voltage"
+    mains_current:
+      name: "Multiplus Mains Current"
+    inverter_voltage:
+      name: "Multiplus Inverter Voltage"
+    inverter_current:
+      name: "Multiplus Inverter Current"
+    output_power:
+      name: "Multiplus AC-Out Power"
+    mains_power:
+      name: "Multiplus Mains Power"
+    soc:
+      name: "Multiplus State of Charge"
+    effective_ess_power:
+      name: "Multiplus Effective ESS Power"
+    ac_out_load:
+      name: "Multiplus AC-Out Load (cached)"
+
+binary_sensor:
+  - platform: vebus
+    sync:
+      name: "Multiplus VE.Bus Sync"
+    dc_allows_inverting:
+      name: "Multiplus DC OK for Inverting"
+
+number:
+  - platform: vebus
+    ess_power:
+      name: "Multiplus ESS Setpoint"
+
+switch:
+  - platform: vebus
+    virtual_setpoint_mode:
+      name: "Multiplus Battery-Neutral UPS Mode"

@@ -50,6 +50,27 @@ The setpoint controls power exchange on the **AC-IN (grid) side**, not AC-OUT:
 | `-300` | Charge battery with 300 W from grid |
 | `0` | Standby — grid pass-through only |
 
+### Virtual Setpoint Mode (battery-neutral UPS)
+
+In normal ESS mode, setpoint `0` still cycles the battery to cover AC-OUT loads.
+**Virtual setpoint mode** subtracts AC-OUT load from the setpoint automatically so
+you can control only the *extra* battery cycling on top of passthrough:
+
+```
+effective_setpoint = virtual_setpoint − ac_out_load
+```
+
+| Virtual | Effect |
+|---------|--------|
+| `0` | **Battery neutral** — grid supplies AC-OUT loads, battery idle |
+| `+300` | Battery discharges 300 W extra to grid (on top of AC-OUT passthrough) |
+| `-300` | Battery charges 300 W extra from grid (on top of AC-OUT passthrough) |
+
+Enable with `enableVirtualSetpointMode(true)` and feed the AC-OUT load to
+`setACOutLoad()` from your read loop (`VEBUS_RAM_OUTPUT_POWER`, RAM id 16).
+The library re-sends the effective setpoint whenever the load changes by more
+than the deadband (default 10 W).
+
 ## Hardware — LilyGo T-CAN485
 
 The T-CAN485 uses a **MAX13487E** RS485 transceiver with auto-direction
@@ -210,6 +231,13 @@ Full example with automatic no-sync recovery and interactive serial commands:
 Publishes all Multiplus data as HA entities. RAM variables are read in two
 batches per cycle (6 + 4 IDs), device state is polled once per cycle.
 
+**Self-configuration UI (WiFiManager):** on first boot the device starts an
+open AP named `VEBus-Setup`. Connect to it, the captive portal asks for WiFi
+credentials plus the MQTT host/port/user/pass/device-id/topic-prefix. Values
+are persisted to NVS. After the device joins WiFi the same config form stays
+reachable at `http://<device-ip>/` so you can edit MQTT settings any time
+without re-flashing.
+
 **Sensors (23):**
 
 | Sensor | Source | Unit |
@@ -219,7 +247,8 @@ batches per cycle (6 + 4 IDs), device state is polled once per cycle.
 | DC Current | `getDCCurrent()` | A |
 | Temperature | `getTemp()` | °C |
 | Charger Status | `getChargerStatus()` | — |
-| ESS Power | local setpoint | W |
+| ESS Power | local setpoint (virtual setpoint when virtual mode on) | W |
+| Effective ESS Power | what's actually sent to the inverter | W |
 | Mains Voltage | RAM ID 0 | V |
 | Mains Current | RAM ID 1 | A |
 | Inverter Voltage | RAM ID 2 | V |
@@ -244,12 +273,13 @@ batches per cycle (6 + 4 IDs), device state is polled once per cycle.
 | VE.Bus Sync | `hasNoSync()` |
 | DC Allows Inverting | `dcLevelAllowsInverting()` |
 
-**Controls (8):**
+**Controls (9):**
 
 | Entity | Type | Details |
 |--------|------|---------|
 | ESS Power Setpoint | Number | -1875..1875 W |
 | Switch State | Select | on / off / charger_only / inverter_only |
+| Battery-Neutral UPS Mode | Switch | toggles virtual setpoint mode |
 | Wakeup Multiplus | Button | — |
 | Sleep Multiplus | Button | — |
 | Force Absorption | Button | — |
@@ -261,6 +291,23 @@ Firmware version is published once (retained) at MQTT connect.
 ### `raw_test` — RS485 hardware test
 
 Minimal hex dumper that bypasses the library — useful for verifying RS485 wiring.
+
+### `esphome_vebus.yaml` — ESPHome external component
+
+The repo also ships an ESPHome wrapper under `components/vebus/` so the same
+library is usable from a YAML-only ESPHome config. Pull it in with:
+
+```yaml
+external_components:
+  - source: github://mkrasselt1/ve.bus-library
+    components: [vebus]
+```
+
+The wrapper exposes a `vebus` hub plus `sensor`, `binary_sensor`, `number`, and
+`switch` platforms — see `examples/esphome_vebus.yaml` for the full config.
+
+The library's RS485 task runs on its own FreeRTOS core (configure with
+`core: 1`), so blocking serial I/O never touches ESPHome's main loop.
 
 ## PlatformIO
 
@@ -292,6 +339,22 @@ void setESSPower(int16_t watts);
 Queue an ESS power setpoint. Resets the command queue first (only the
 latest setpoint matters). Must be sent at least every 60 seconds or the
 Multiplus enters passthrough mode.
+
+#### Virtual setpoint mode
+
+```cpp
+void    enableVirtualSetpointMode(bool enable, int16_t deadbandWatts = 10);
+bool    isVirtualSetpointMode() const;
+void    setACOutLoad(int16_t watts);     // feed RAM var 16 (OUTPUT_POWER)
+int16_t getVirtualSetpoint()   const;    // what you last passed to setESSPower
+int16_t getACOutLoad()         const;    // last AC-out load you fed in
+int16_t getEffectiveESSPower() const;    // last value sent to inverter
+```
+
+When enabled, `setESSPower(W)` is interpreted as the virtual setpoint and the
+library sends `W − ac_out_load` to the inverter. Call `setACOutLoad()` whenever
+you have a fresh reading of RAM variable 16. The library re-sends the effective
+setpoint automatically whenever the load drift exceeds `deadbandWatts`.
 
 ### Legacy RAM Read
 

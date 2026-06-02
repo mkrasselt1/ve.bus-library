@@ -27,6 +27,10 @@
 //   > 0  →  invert: push watts FROM battery TOWARD grid/AC-IN
 //   < 0  →  charge: pull watts FROM grid INTO battery
 //   = 0  →  standby: grid pass-through only
+//
+// In virtual setpoint mode (`vm 1`), the value above is the *virtual*
+// setpoint — extra battery cycling on top of AC-out passthrough.
+//   = 0  →  battery neutral: AC-in supplies AC-out load, battery idle
 // -----------------------------------------------------------------------
 volatile int16_t g_essPower = 0;
 
@@ -41,6 +45,7 @@ VEBus vebus;
 #define ESS_INTERVAL_MS   5000   // send ESS power every 5 s
 #define RAM_OFFSET_MS      500   // request data 500 ms before next ESS
 #define PRINT_INTERVAL_MS 2000   // print status every 2 s
+#define LOAD_POLL_MS      1000   // poll AC-out load every 1 s in virtual mode
 
 // -----------------------------------------------------------------------
 // Device state name helper
@@ -59,6 +64,22 @@ static const char *deviceStateName(uint8_t state)
     case VEBUS_STATE_BYPASS:       return "Bypass";
     case VEBUS_STATE_CHARGE:       return "Charge";
     default:                       return "Unknown";
+    }
+}
+
+static const char *ramVarName(uint8_t id)
+{
+    switch (id) {
+    case VEBUS_RAM_UMAINS_RMS:     return "Mains V";
+    case VEBUS_RAM_IMAINS_RMS:     return "Mains A";
+    case VEBUS_RAM_UINVERTER_RMS:  return "Inv V";
+    case VEBUS_RAM_IINVERTER_RMS:  return "Inv A";
+    case VEBUS_RAM_UBAT:           return "Battery V";
+    case VEBUS_RAM_IBAT:           return "Battery A";
+    case VEBUS_RAM_INVERTER_POWER: return "Inv W";
+    case VEBUS_RAM_OUTPUT_POWER:   return "Output W";
+    case VEBUS_RAM_CHARGE_STATE:   return "SoC";
+    default:                       return "RAM?";
     }
 }
 
@@ -99,6 +120,8 @@ void printHelp()
     Serial.println("  ws <id> <val>  Write setting (e.g. ws 6 160 = AC limit 16.0A)");
     Serial.println("  ri <id>    Request RAM var info (scale/offset)");
     Serial.println("  si <id>    Request setting info (scale/offset/default/min/max)");
+    Serial.println("  vm 0|1     Virtual setpoint mode off/on (battery-neutral UPS)");
+    Serial.println("  vd <w>     Set virtual-mode deadband in watts (default 10)");
     Serial.println("  h          Show this help");
     Serial.println();
 }
@@ -130,9 +153,10 @@ void setup()
 // -----------------------------------------------------------------------
 void loop()
 {
-    static unsigned long lastESSMs   = 0;
-    static unsigned long lastRAMMs   = 0;
-    static unsigned long lastPrintMs = 0;
+    static unsigned long lastESSMs    = 0;
+    static unsigned long lastRAMMs    = 0;
+    static unsigned long lastPrintMs  = 0;
+    static unsigned long lastLoadMs   = 0;
     static bool          ramRequested = false;
 
     unsigned long now = millis();
@@ -152,6 +176,14 @@ void loop()
         ramRequested = true;
     }
 
+    // --- In virtual mode, poll AC-out load every LOAD_POLL_MS ---
+    if (vebus.isVirtualSetpointMode() && (now - lastLoadMs >= LOAD_POLL_MS))
+    {
+        lastLoadMs = now;
+        const uint8_t loadIds[] = { VEBUS_RAM_OUTPUT_POWER };
+        vebus.readRAMVars(loadIds, 1);
+    }
+
     // --- Auto-wakeup if no sync ---
     if (vebus.hasNoSync())
     {
@@ -168,14 +200,26 @@ void loop()
     if (vebus.hasRAMVarResponse())
     {
         vebus.clearRAMVarResponse();
-        Serial.println("--- Extended RAM values ---");
-        const char *names[] = {"Mains V", "Mains A", "Inv V", "Inv A", "Output W", "SoC"};
-        for (uint8_t i = 0; i < vebus.getRAMVarCount(); i++)
-        {
-            const char *name = (i < 6) ? names[i] : "?";
-            Serial.printf("  %s : %d (raw)\n", name, vebus.getRAMVarValue(i));
+        uint8_t count = vebus.getRAMVarCount();
+
+        // Feed AC-out load to virtual setpoint mode whenever output power is present
+        for (uint8_t i = 0; i < count; i++) {
+            if (vebus.getRAMVarId(i) == VEBUS_RAM_OUTPUT_POWER) {
+                vebus.setACOutLoad(vebus.getRAMVarValue(i));
+                break;
+            }
         }
-        Serial.println();
+
+        // Silence prints for the single-var auto-poll; only print multi-var reads (user `r`)
+        if (count > 1) {
+            Serial.println("--- Extended RAM values ---");
+            for (uint8_t i = 0; i < count; i++) {
+                Serial.printf("  %-10s : %d (raw)\n",
+                              ramVarName(vebus.getRAMVarId(i)),
+                              vebus.getRAMVarValue(i));
+            }
+            Serial.println();
+        }
     }
 
     // --- Check for setting responses ---
@@ -245,7 +289,14 @@ void loop()
         Serial.printf("  AC power        : %d W\n",    vebus.getACPower());
         Serial.printf("  DC current      : %.1f A\n",  vebus.getDCCurrent());
         Serial.printf("  Temperature     : %.1f C\n",  vebus.getTemp());
-        Serial.printf("  ESS setpoint    : %d W\n",    (int)g_essPower);
+        if (vebus.isVirtualSetpointMode()) {
+            Serial.printf("  ESS setpoint    : virtual=%d W  effective=%d W  AC-out=%d W\n",
+                          (int)vebus.getVirtualSetpoint(),
+                          (int)vebus.getEffectiveESSPower(),
+                          (int)vebus.getACOutLoad());
+        } else {
+            Serial.printf("  ESS setpoint    : %d W\n", (int)g_essPower);
+        }
 
         byte leds = vebus.getLEDon();
         Serial.printf("  LEDs on/blink   : 0x%02X / 0x%02X", leds, vebus.getLEDblink());
@@ -375,6 +426,28 @@ void loop()
             uint8_t id = (uint8_t)input.substring(3).toInt();
             vebus.requestSettingInfo(id);
             Serial.printf("[app] Setting %d info request queued\n", id);
+        }
+        else if (input.startsWith("vm"))
+        {
+            String arg = input.length() > 2 ? input.substring(3) : String();
+            arg.trim();
+            if (arg.length() == 0) {
+                Serial.printf("[app] Virtual mode = %s (virtual=%d W, AC-out=%d W, effective=%d W)\n",
+                              vebus.isVirtualSetpointMode() ? "ON" : "OFF",
+                              (int)vebus.getVirtualSetpoint(),
+                              (int)vebus.getACOutLoad(),
+                              (int)vebus.getEffectiveESSPower());
+            } else {
+                bool on = (arg.toInt() != 0);
+                vebus.enableVirtualSetpointMode(on);
+                Serial.printf("[app] Virtual mode → %s\n", on ? "ON" : "OFF");
+            }
+        }
+        else if (input.startsWith("vd "))
+        {
+            int16_t db = (int16_t)input.substring(3).toInt();
+            vebus.enableVirtualSetpointMode(vebus.isVirtualSetpointMode(), db);
+            Serial.printf("[app] Virtual-mode deadband → %d W\n", (int)db);
         }
         else if (input.length() > 0)
         {

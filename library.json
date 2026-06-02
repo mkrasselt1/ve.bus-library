@@ -1,7 +1,7 @@
 {
   "name": "VEBus",
-  "version": "1.0.0",
-  "description": "ESP32 Arduino library for Victron Multiplus VE.Bus RS485 communication. Supports ESS power setpoint, sleep/wake commands, and battery/AC data readback.",
+  "version": "1.1.0",
+  "description": "ESP32 Arduino library for Victron Multiplus VE.Bus RS485 communication. Supports ESS power setpoint (with optional battery-neutral virtual setpoint mode), sleep/wake commands, battery/AC data readback, and ESPHome integration.",
   "keywords": ["victron", "ve.bus", "multiplus", "ess", "inverter", "charger", "rs485", "esp32"],
   "authors": [
     {
