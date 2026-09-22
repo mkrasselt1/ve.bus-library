@@ -41,6 +41,11 @@ Protocol reference and additional features derived from:
 - Robust frame receiver — line noise or truncated frames cannot overflow buffers
 - Comprehensive constants for RAM IDs, setting IDs, device states, LED/switch bitmasks
 
+**Ready-to-flash firmware** (`mqtt_ha` example): Home Assistant via MQTT
+auto-discovery, web dashboard with history charts, password-protected
+settings, OTA updates, and the Multiplus as a network UPS for NAS/servers via
+**NUT** (port 3493) and **apcupsd** (port 3551) — see [Examples](#examples).
+
 ## ESS Setpoint Semantics
 
 The setpoint controls power exchange on the **AC-IN (grid) side**, not AC-OUT:
@@ -227,10 +232,24 @@ Full example with automatic no-sync recovery and interactive serial commands:
 | `si <id>` | Query setting info (scale/offset/default/min/max) |
 | `h` | Show help |
 
-### `mqtt_ha` — MQTT with Home Assistant auto-discovery
+### `mqtt_ha` — Home Assistant, web dashboard, network UPS
 
-Publishes all Multiplus data as HA entities. RAM variables are read in two
-batches per cycle (6 + 4 IDs), device state is polled once per cycle.
+A complete firmware for the T-CAN485:
+
+- all Multiplus data as Home Assistant entities (MQTT auto-discovery)
+- web dashboard with 24 h charts, password-protected settings and controls
+- network UPS server for NAS/servers: NUT (port 3493) and apcupsd (port 3551)
+- firmware updates over the network, watchdogs and self-healing WiFi/MQTT
+
+RAM variables are read in two batches per cycle (6 + 4 IDs), device state is
+polled once per cycle.
+
+| Port | Service |
+|------|---------|
+| 80   | web dashboard (`/`) and admin UI (`/admin/`) |
+| 3493 | NUT server (`<ups>@<device-ip>`, default UPS name `multiplus`) |
+| 3551 | apcupsd NIS server |
+| —    | MQTT client → your broker (`<prefix>/state`, `<prefix>/<cmd>/set`) |
 
 **First setup (WiFiManager):** on first boot (or when the saved WiFi is not
 reachable) the device opens an AP named `VEBus-Setup`. The captive portal asks
@@ -243,7 +262,7 @@ a web admin password. Values are persisted to NVS.
 | Page | Access | Content |
 |------|--------|---------|
 | `/` | public, read-only | live values, VE.Bus/MQTT/WiFi status, 1 h / 6 h / 24 h charts (power, battery voltage, SoC; 1-minute averages kept in RAM) |
-| `/admin/` | HTTP basic auth, user `admin`, default password `vebus` | ESS setpoint, switch state, battery-neutral mode, charge buttons, MQTT settings, ESS fail-safe timeout, NUT settings, admin password, OTA firmware upload, reboot, WiFi reset |
+| `/admin/` | HTTP basic auth, user `admin`, default password `vebus` | ESS setpoint, switch state, battery-neutral mode, charge buttons, MQTT settings, ESS fail-safe timeout, NUT/apcupsd settings (UPS name, credentials, low-battery SoC, nominal power, battery capacity), admin password, OTA firmware upload, reboot, WiFi reset |
 
 Change the default password — the dashboard shows a warning until you do.
 JSON endpoints: `/api/state`, `/api/history`.
@@ -380,6 +399,20 @@ Commands: publish to `<prefix>/<command>/set` — `ess_power` (W),
 (`ON`/`OFF`), `wakeup`, `sleep`, `force_absorption`, `force_float`,
 `force_equalise` (any payload).
 
+**Troubleshooting:**
+
+| Symptom | Cause / fix |
+|---------|-------------|
+| Serial log `[MQTT] Connecting... failed (rc=5)` | broker rejected user/password — correct them in `/admin/` |
+| `rc=-2` | broker not reachable (host/port, firewall) |
+| `[app] No sync — queued wakeup`, dashboard "VE.Bus" red | no frames from the Multiplus: check cable, A/B swapped, transceiver mod, Multiplus switched on |
+| HA shows the device but values are "unavailable" | normal until VE.Bus data arrives (sensors expire after 60 s without data) |
+| HA "Wakeup"/"Sleep" buttons missing | HA may create them disabled — enable them on the device page |
+| NUT client: `ERR DATA-STALE` | no VE.Bus data yet; `LIST VAR` still works for setup |
+| NUT `battery.charge` / apcupsd `TIMELEFT` missing | only reported after the first SoC reading / with a battery capacity set; reload the HA integration afterwards |
+| Device unreachable after WiFi change | it reopens the `VEBus-Setup` AP after 30 s without WiFi at boot; reboots itself after 10 min offline |
+| Board rebooted, dashboard footer shows "task watchdog" | the main loop stalled for 30 s and the watchdog recovered it — please report with the serial log |
+
 ### `raw_test` — RS485 hardware test
 
 Minimal hex dumper that bypasses the library — useful for verifying RS485 wiring.
@@ -406,8 +439,10 @@ The library's RS485 task runs on its own FreeRTOS core (configure with
 The `platformio.ini` at the repo root has environments for all examples:
 
 ```bash
-pio run -e basic_ess    # Serial console ESS control
-pio run -e mqtt_ha      # MQTT → Home Assistant
+pio run -e basic_ess                 # Serial console ESS control
+pio run -e mqtt_ha -t upload         # MQTT/HA/NUT/apcupsd firmware via USB
+VEBUS_ADMIN_PASS=... pio run -e mqtt_ha_ota -t upload --upload-port <device-ip>   # same, over the network
+pio run -e raw_test                  # RS485 hex dump
 ```
 
 ## API Reference

@@ -1,8 +1,8 @@
 {
   "name": "VEBus",
   "version": "1.2.0",
-  "description": "ESP32 Arduino library for Victron Multiplus VE.Bus RS485 communication. Supports ESS power setpoint (with optional battery-neutral virtual setpoint mode), sleep/wake commands, battery/AC data readback, and ESPHome integration.",
-  "keywords": ["victron", "ve.bus", "multiplus", "ess", "inverter", "charger", "rs485", "esp32"],
+  "description": "ESP32 Arduino library for Victron Multiplus VE.Bus RS485 communication. Supports ESS power setpoint (with optional battery-neutral virtual setpoint mode), sleep/wake commands, battery/AC data readback, and ESPHome integration. Example firmware adds Home Assistant MQTT discovery, a web dashboard, OTA updates and NUT/apcupsd network UPS servers.",
+  "keywords": ["victron", "ve.bus", "multiplus", "ess", "inverter", "charger", "rs485", "esp32", "home-assistant", "mqtt", "ups", "nut", "apcupsd"],
   "authors": [
     {
       "name": "Michael Krasselt",
