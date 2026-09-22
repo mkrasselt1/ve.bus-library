@@ -550,7 +550,7 @@ static const Entity ENTITIES[] = {
 };
 static const uint8_t ENTITY_COUNT = sizeof(ENTITIES) / sizeof(ENTITIES[0]);
 
-static void publishEntity(const Entity &e)
+static bool publishEntity(const Entity &e)
 {
     char uid[64], ct[128];
     if (e.devUid) snprintf(uid, sizeof(uid), "%s_%s", cfg.deviceId, e.uid);
@@ -567,10 +567,10 @@ static void publishEntity(const Entity &e)
         j.add(",\"exp_aft\":60");
     if (e.extra[0])
         j.add(",%s", e.extra);
-    j.add(",\"dev\":{\"ids\":[\"%s\"],\"name\":\"Victron Multiplus\",\"mfr\":\"Victron Energy\","
+    j.add(",\"dev\":{\"ids\":[\"%s\"],\"name\":\"Victron Multiplus\",\"mf\":\"Victron Energy\","
           "\"mdl\":\"Multiplus\",\"cu\":\"http://%s/\"}}",
           cfg.deviceId, WiFi.localIP().toString().c_str());
-    mqtt.publish(ct, payloadBuf, true);
+    return mqtt.publish(ct, payloadBuf, true);
 }
 
 // =======================================================================
@@ -1049,9 +1049,16 @@ void loop()
     nut.loop();
     if (nut.fsd && mainsPresent() && !lowBattery()) nut.fsd = false;    // power is back
 
-    // Discovery, one entity per pass
+    // Discovery, one entity per pass; a failed publish is retried (max 3x)
     if (g_discIdx < ENTITY_COUNT && mqtt.connected())
-        publishEntity(ENTITIES[g_discIdx++]);
+    {
+        static uint8_t tries = 0;
+        if (publishEntity(ENTITIES[g_discIdx]) || ++tries >= 3) {
+            if (tries >= 3) Serial.printf("[MQTT] discovery failed: %s\n", ENTITIES[g_discIdx].uid);
+            g_discIdx++;
+            tries = 0;
+        }
+    }
 
     // ESS fail-safe: no fresh setpoint for essTimeoutS → back to 0 W
     if (cfg.essTimeoutS && g_essPower != 0 &&
