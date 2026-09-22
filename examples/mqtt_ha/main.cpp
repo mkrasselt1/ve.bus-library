@@ -12,6 +12,8 @@
  *   reconnect with short timeouts, optional ESS setpoint fail-safe.
  * - NUT server (Network UPS Tools, TCP 3493): NAS/servers/HA can monitor
  *   the Multiplus as a UPS and shut down on low battery.
+ * - apcupsd network server (TCP 3551): apcaccess, apcupsd slaves and the
+ *   Home Assistant "APC UPS Daemon" integration see it as an APC UPS.
  *
  * Hardware: LilyGo T-CAN485 (ESP32, MAX13487E RS485 transceiver)
  *
@@ -31,6 +33,8 @@
 #include <VEBus.h>
 #include "web_ui.h"
 #include "nut_server.h"
+#include "apcupsd_server.h"
+#include <time.h>
 
 #ifndef ESP_ARDUINO_VERSION_MAJOR
 #define ESP_ARDUINO_VERSION_MAJOR 2
@@ -98,6 +102,8 @@ struct Config {
     char     nutPass[32];
     uint8_t  lowSoc;            // % SoC that triggers LB (0 = LED only)
     uint16_t nominalW;          // for ups.load (0 = don't report)
+    bool     apcEnabled;        // apcupsd NIS server on port 3551
+    uint16_t batteryWh;         // usable capacity for runtime estimate (0 = unknown)
 } cfg;
 
 WiFiClient   wifiClient;
@@ -107,6 +113,7 @@ WiFiManager  wm;
 Preferences  prefs;
 WebServer    server(80);
 NutServer    nut;
+ApcupsdServer apc;
 
 char hostName[32];              // deviceId sanitised for DHCP / mDNS
 
@@ -128,6 +135,13 @@ bool     g_publishNow     = false;
 uint8_t  g_discIdx        = 0xFF;    // next discovery entity (0xFF = done)
 uint32_t g_restartAtMs    = 0;
 bool     g_otaAuthed      = false;
+
+// Mains-failure bookkeeping (apcupsd TONBATT / CUMONBATT / NUMXFERS)
+bool     g_onBatt         = false;
+uint32_t g_onBattSinceMs  = 0;
+uint32_t g_cumOnBattS     = 0;
+uint32_t g_numXfers       = 0;
+uint32_t g_bootEpoch      = 0;       // wall clock at boot, once NTP synced
 
 char     payloadBuf[1536];
 
@@ -254,6 +268,8 @@ static void loadConfig()
     strlcpy(cfg.nutPass,   prefs.getString("nutpass", "").c_str(),              sizeof(cfg.nutPass));
     cfg.lowSoc      =      prefs.getUChar("lowsoc",   DEFAULT_LOW_SOC);
     cfg.nominalW    =      prefs.getUShort("nomw",    0);
+    cfg.apcEnabled  =      prefs.getBool("apc",       true);
+    cfg.batteryWh   =      prefs.getUShort("batwh",   0);
     prefs.end();
     if (!cfg.nutUps[0]) strlcpy(cfg.nutUps, DEFAULT_NUT_UPS, sizeof(cfg.nutUps));
     if (cfg.mqttPort == 0) cfg.mqttPort = DEFAULT_MQTT_PORT;
@@ -277,6 +293,8 @@ static void saveConfig()
     prefs.putString("nutpass", cfg.nutPass);
     prefs.putUChar("lowsoc",   cfg.lowSoc);
     prefs.putUShort("nomw",    cfg.nominalW);
+    prefs.putBool("apc",       cfg.apcEnabled);
+    prefs.putUShort("batwh",   cfg.batteryWh);
     prefs.end();
 }
 
@@ -390,6 +408,8 @@ static void upsStatus(char *out, size_t n)
     if (nut.fsd)                b.add(" FSD");
 }
 
+static float runtimeMinutes();
+
 // Variables served over NUT. Returns false (-> ERR DATA-STALE) without VE.Bus sync.
 static bool nutVars(std::function<void(const char *, const char *)> emit)
 {
@@ -414,6 +434,8 @@ static bool nutVars(std::function<void(const char *, const char *)> emit)
         snprintf(v, sizeof(v), "%d", (int)constrain(live.soc, 0, 100)); emit("battery.charge", v);
     }
     snprintf(v, sizeof(v), "%u", cfg.lowSoc);                     emit("battery.charge.low", v);
+    float rt = runtimeMinutes();
+    if (rt >= 0) { snprintf(v, sizeof(v), "%ld", lroundf(rt * 60)); emit("battery.runtime", v); }
     snprintf(v, sizeof(v), "%.2f", vebus.getBatVolt());           emit("battery.voltage", v);
     snprintf(v, sizeof(v), "%d", live.batA);                      emit("battery.current", v);
     snprintf(v, sizeof(v), "%d", live.mainsV);                    emit("input.voltage", v);
@@ -426,12 +448,121 @@ static bool nutVars(std::function<void(const char *, const char *)> emit)
     return !vebus.hasNoSync();
 }
 
+// Remaining runtime in minutes from capacity, SoC and current load; -1 = unknown.
+static float runtimeMinutes()
+{
+    if (!cfg.batteryWh || !live.socValid || vebus.hasNoSync()) return -1;
+    float whLeft = cfg.batteryWh * constrain(live.soc, 0, 100) / 100.0f;
+    float load   = max((float)live.outW, 20.0f);        // idle consumption floor
+    return min(whLeft / load * 60.0f, 9999.0f);
+}
+
+// Current mains-failure duration in seconds (0 while on mains).
+static uint32_t secondsOnBattery()
+{
+    return g_onBatt ? (millis() - g_onBattSinceMs) / 1000 : 0;
+}
+
+static void trackMainsFailures()
+{
+    if (vebus.hasNoSync()) return;
+    bool onBatt = !mainsPresent();
+    if (onBatt && !g_onBatt) {
+        g_onBattSinceMs = millis();
+        g_numXfers++;
+        Serial.println("[ups] mains lost — on battery");
+    } else if (!onBatt && g_onBatt) {
+        g_cumOnBattS += secondsOnBattery();
+        Serial.println("[ups] mains restored");
+    }
+    g_onBatt = onBatt;
+}
+
+static void fmtApcDate(char *out, size_t n, time_t t)
+{
+    struct tm tm;
+    gmtime_r(&t, &tm);
+    strftime(out, n, "%Y-%m-%d %H:%M:%S +0000", &tm);
+}
+
+// Status lines in the order apcupsd prints them.
+static void apcFields(std::function<void(const char *, const char *)> emit)
+{
+    char v[48];
+    time_t now = time(nullptr);
+    bool   clock = now > 1600000000;
+    bool   stale = vebus.hasNoSync();
+
+    if (clock) { fmtApcDate(v, sizeof(v), now); emit("DATE", v); }
+    emit("HOSTNAME", hostName);
+    emit("VERSION",  "3.14.14 (31 May 2016) vebus-esp32");
+    emit("UPSNAME",  cfg.nutUps);
+    emit("CABLE",    "VE.Bus RS485");
+    emit("DRIVER",   "VE.Bus ESP32 Driver");
+    emit("UPSMODE",  "Stand Alone");
+    if (clock && g_bootEpoch) { fmtApcDate(v, sizeof(v), g_bootEpoch); emit("STARTTIME", v); }
+    emit("MODEL",    "Victron MultiPlus");
+
+    // STATFLAG bits as defined by apcupsd
+    const uint32_t ONLINE = 0x08, ONBATT = 0x10, OVERLOAD = 0x20, BATTLOW = 0x40,
+                   COMMLOST = 0x100, SHUTDOWN = 0x200, PLUGGED = 0x1000000,
+                   BATTPRESENT = 0x4000000;
+    uint32_t flags = PLUGGED | BATTPRESENT;
+    char status[40];
+    Buf st(status, sizeof(status));
+    if (stale) {
+        flags |= COMMLOST;
+        st.add("COMMLOST");
+    } else {
+        bool mains = mainsPresent();
+        flags |= mains ? ONLINE : ONBATT;
+        st.add(mains ? "ONLINE" : "ONBATT");
+        if (lowBattery()) { flags |= BATTLOW; st.add(" LOWBATT"); }
+        if ((vebus.getLEDon() | vebus.getLEDblink()) & VEBUS_LED_OVERLOAD) { flags |= OVERLOAD; st.add(" OVERLOAD"); }
+        if (nut.fsd) { flags |= SHUTDOWN; st.add(" SHUTTING DOWN"); }
+    }
+    emit("STATUS", status);
+
+    if (!stale) {
+        snprintf(v, sizeof(v), "%.1f Volts", (float)live.mainsV);            emit("LINEV", v);
+        if (cfg.nominalW) {
+            snprintf(v, sizeof(v), "%.1f Percent", constrain(live.outW * 100.0f / cfg.nominalW, 0.0f, 200.0f));
+            emit("LOADPCT", v);
+        }
+        if (live.socValid) {
+            snprintf(v, sizeof(v), "%.1f Percent", (float)constrain(live.soc, 0, 100)); emit("BCHARGE", v);
+        }
+        float rt = runtimeMinutes();
+        if (rt >= 0) { snprintf(v, sizeof(v), "%.1f Minutes", rt);           emit("TIMELEFT", v); }
+    }
+    snprintf(v, sizeof(v), "%u Percent", cfg.lowSoc);                        emit("MBATTCHG", v);
+    if (!stale) {
+        snprintf(v, sizeof(v), "%.1f Volts", (float)live.invV);             emit("OUTPUTV", v);
+        snprintf(v, sizeof(v), "%.1f C", vebus.getTemp());                   emit("ITEMP", v);
+        snprintf(v, sizeof(v), "%.1f Volts", vebus.getBatVolt());            emit("BATTV", v);
+        snprintf(v, sizeof(v), "%.1f Hz", periodToHz(live.mainsPeriod));     emit("LINEFREQ", v);
+    }
+    snprintf(v, sizeof(v), "%lu", (unsigned long)g_numXfers);               emit("NUMXFERS", v);
+    snprintf(v, sizeof(v), "%lu Seconds", (unsigned long)secondsOnBattery()); emit("TONBATT", v);
+    snprintf(v, sizeof(v), "%lu Seconds", (unsigned long)(g_cumOnBattS + secondsOnBattery()));
+    emit("CUMONBATT", v);
+    snprintf(v, sizeof(v), "0x%08lX", (unsigned long)flags);                emit("STATFLAG", v);
+    uint8_t mac[6];
+    WiFi.macAddress(mac);
+    snprintf(v, sizeof(v), "VEBUS%02X%02X%02X%02X%02X%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);               emit("SERIALNO", v);
+    if (cfg.nominalW) { snprintf(v, sizeof(v), "%u Watts", cfg.nominalW);  emit("NOMPOWER", v); }
+    if (g_fwVersion[0]) emit("FIRMWARE", g_fwVersion);
+    if (clock) { fmtApcDate(v, sizeof(v), now); emit("END APC", v); }
+}
+
 static void applyNutConfig()
 {
     nut.upsName = cfg.nutUps;
     nut.user    = cfg.nutUser;
     nut.pass    = cfg.nutPass;
     if (!cfg.nutEnabled) nut.end();   // started from loop() once WiFi is up
+    if (!cfg.apcEnabled) apc.end();
 }
 
 // =======================================================================
@@ -463,7 +594,8 @@ static void buildStateJson(Buf &j)
           vebus.dcLevelAllowsInverting() ? "ON" : "OFF", switchStateName());
     char ups[32];
     upsStatus(ups, sizeof(ups));
-    j.add("\"ups_status\":\"%s\",\"nut_clients\":%u,", ups, (unsigned)nut.clientCount());
+    j.add("\"ups_status\":\"%s\",\"nut_clients\":%u,\"apc_clients\":%u,", ups,
+          (unsigned)nut.clientCount(), (unsigned)apc.clientCount());
     j.add("\"firmware_version\":\"%s\",\"rssi\":%d,\"uptime\":%lu,\"free_heap\":%u}",
           g_fwVersion, (int)WiFi.RSSI(), (unsigned long)(millis() / 1000),
           (unsigned)ESP.getFreeHeap());
@@ -731,8 +863,9 @@ static void handleGetConfig()
           isDefaultPassword() ? "true" : "false");
     j.add(",\"nut\":%s,\"nut_ups\":", cfg.nutEnabled ? "true" : "false"); j.str(cfg.nutUps);
     j.add(",\"nut_user\":"); j.str(cfg.nutUser);
-    j.add(",\"nut_pass_set\":%s,\"low_soc\":%u,\"nominal_w\":%u}",
-          cfg.nutPass[0] ? "true" : "false", cfg.lowSoc, cfg.nominalW);
+    j.add(",\"nut_pass_set\":%s,\"low_soc\":%u,\"nominal_w\":%u,\"apc\":%s,\"battery_wh\":%u}",
+          cfg.nutPass[0] ? "true" : "false", cfg.lowSoc, cfg.nominalW,
+          cfg.apcEnabled ? "true" : "false", cfg.batteryWh);
     sendJson(payloadBuf);
 }
 
@@ -767,6 +900,8 @@ static void handlePostConfig()
         if (!cfg.nutUser[0]) cfg.nutPass[0] = '\0';
         cfg.lowSoc   = (uint8_t)constrain(server.arg("low_soc").toInt(), 0, 100);
         cfg.nominalW = (uint16_t)constrain(server.arg("nominal_w").toInt(), 0, 65535);
+        cfg.apcEnabled = server.hasArg("apc");
+        cfg.batteryWh  = (uint16_t)constrain(server.arg("battery_wh").toInt(), 0, 65535);
     }
     if (server.hasArg("admin_pass")) {
         String p = server.arg("admin_pass");
@@ -999,6 +1134,7 @@ void setup()
     Serial.printf("[wifi] connected (%s)\n", WiFi.localIP().toString().c_str());
 
     if (MDNS.begin(hostName)) MDNS.addService("http", "tcp", 80);
+    configTime(0, 0, "pool.ntp.org", "time.google.com");   // timestamps for apcupsd
     setupWebServer();
     Serial.printf("[web] dashboard at http://%s/ (http://%s.local/)\n",
                   WiFi.localIP().toString().c_str(), hostName);
@@ -1015,6 +1151,7 @@ void setup()
     // NUT server (started from loop() once WiFi is up)
     nut.upsDesc = "Victron MultiPlus (VE.Bus)";
     nut.vars    = nutVars;
+    apc.fields  = apcFields;
     applyNutConfig();
     if (cfg.nutEnabled)
         Serial.printf("[nut] UPS '%s' on port 3493%s\n", cfg.nutUps,
@@ -1047,6 +1184,11 @@ void loop()
 
     if (cfg.nutEnabled && WiFi.status() == WL_CONNECTED) nut.begin();   // no-op once running
     nut.loop();
+    if (cfg.apcEnabled && WiFi.status() == WL_CONNECTED) apc.begin();
+    apc.loop();
+    trackMainsFailures();
+    if (!g_bootEpoch && time(nullptr) > 1600000000)
+        g_bootEpoch = time(nullptr) - millis() / 1000;
     if (nut.fsd && mainsPresent() && !lowBattery()) nut.fsd = false;    // power is back
 
     // Discovery, one entity per pass; a failed publish is retried (max 3x)

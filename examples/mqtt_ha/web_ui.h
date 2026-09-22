@@ -102,7 +102,7 @@ const DETAILS=[['AC','ac_power','AC power','W'],['AC','mains_voltage','Mains vol
 ['DC','dc_current','DC current','A'],['DC','dc_allows_inv','DC allows inverting',''],['DC','charger_status','Charger status',''],
 ['DC','charge_sub_state','Charge sub-state',''],['ESS','ess_power_eff','Effective ESS power','W'],['ESS','virtual_mode','Battery-neutral mode',''],
 ['ESS','switch_state','Switch state',''],['Status','led_on','LED on',''],['Status','led_blink','LED blink',''],
-['Status','ups_status','UPS status (NUT)',''],['Status','nut_clients','NUT clients',''],['Status','checksum_faults','Checksum faults',''],['Status','firmware_version','VE.Bus firmware','']];
+['Status','ups_status','UPS status (NUT)',''],['Status','nut_clients','NUT clients',''],['Status','apc_clients','apcupsd clients',''],['Status','checksum_faults','Checksum faults',''],['Status','firmware_version','VE.Bus firmware','']];
 const SERIES={cPower:[{i:0,n:'Output',c:'--s1'},{i:1,n:'Mains',c:'--s2'},{i:2,n:'ESS effective',c:'--s3'}],
 cBatV:[{i:3,n:'Battery',c:'--s1',k:.01,d:2}],cSoc:[{i:4,n:'SoC',c:'--s1'}]};
 let hist=null,range=1440,failCount=0;
@@ -199,16 +199,18 @@ static const char ADMIN_HTML[] PROGMEM = R"rawliteral(<!doctype html>
 </div>
 <p class="note">Fail-safe: if no new ESS setpoint arrives (MQTT, web or serial) within this time, the setpoint returns to 0 W — protects the battery if Home Assistant or the network goes down.</p>
 <label class="note"><input type="checkbox" name="clear_pass" value="1"> remove stored MQTT password</label>
-<h2 style="margin-top:16px">Network UPS (NUT)</h2>
-<label class="note"><input type="checkbox" name="nut" value="1"> NUT server enabled (TCP port 3493)</label>
+<h2 style="margin-top:16px">UPS protocols (NUT / apcupsd)</h2>
+<div class="row"><label class="note"><input type="checkbox" name="nut" value="1"> NUT server (TCP 3493)</label>
+<label class="note"><input type="checkbox" name="apc" value="1"> apcupsd server (TCP 3551)</label></div>
 <div class="grid2" style="margin-top:8px">
 <label class="f">UPS name<input name="nut_ups" maxlength="15" pattern="[A-Za-z0-9_.-]+"></label>
 <label class="f">NUT user (empty = no login required)<input name="nut_user" autocomplete="off" maxlength="31"></label>
 <label class="f">NUT password<input name="nut_pass" type="password" autocomplete="new-password" id="npass" maxlength="31"></label>
 <label class="f">Low battery at SoC (%, 0 = LED only)<input name="low_soc" type="number" min="0" max="100"></label>
 <label class="f">Nominal power (W, for load %, 0 = off)<input name="nominal_w" type="number" min="0" max="65535"></label>
+<label class="f">Usable battery capacity (Wh, for runtime, 0 = off)<input name="battery_wh" type="number" min="0" max="65535"></label>
 </div>
-<p class="note" id="nutHint">Clients (Synology, TrueNAS, Proxmox, upsmon, Home Assistant NUT) connect to <code>&lt;ups&gt;@&lt;device-ip&gt;</code>. Status is OL (mains) / OB (on battery); LB (low battery) is raised by the Multiplus low-battery LED or the SoC threshold — that is what triggers the shutdown on your clients.</p>
+<p class="note" id="nutHint">NUT clients (Synology, TrueNAS, Proxmox, upsmon, Home Assistant NUT) connect to <code>&lt;ups&gt;@&lt;device-ip&gt;</code>; apcupsd clients (apcaccess, apcupsd slaves, Home Assistant "APC UPS Daemon") to <code>&lt;device-ip&gt;:3551</code>. The battery capacity enables the remaining-runtime estimate (TIMELEFT / battery.runtime); without it apcupsd slaves shut down on charge % and the low-battery flag only. Status is OL (mains) / OB (on battery); LB (low battery) is raised by the Multiplus low-battery LED or the SoC threshold — that is what triggers the shutdown on your clients.</p>
 <h2 style="margin-top:16px">Admin password</h2><div class="grid2">
 <label class="f">New password (user: admin)<input type="password" id="ap1" autocomplete="new-password" minlength="4" maxlength="31"></label>
 <label class="f">Repeat<input type="password" id="ap2" autocomplete="new-password"></label></div>
@@ -236,7 +238,7 @@ async function state(){try{const s=await (await fetch('/api/state',{cache:'no-st
   $('sys').textContent=`Uptime ${Math.floor(s.uptime/3600)} h · free heap ${(s.free_heap/1024).toFixed(0)} kB · last reset: ${s.reset_reason} · WiFi ${s.rssi} dBm`}catch(e){}}
 async function loadCfg(){const c=await (await fetch('/admin/api/config',{cache:'no-store'})).json();const f=$('cfg');
   for(const k of ['host','port','user','device','prefix','ess_timeout','nut_ups','nut_user','low_soc','nominal_w'])f[k].value=c[k];
-  f.nut.checked=c.nut;
+  f.nut.checked=c.nut;f.apc.checked=c.apc;f.battery_wh.value=c.battery_wh;
   $('mpass').placeholder=c.pass_set?'•••••• (unchanged)':'(none)';
   $('npass').placeholder=c.nut_pass_set?'•••••• (unchanged)':'(none)';
   $('nutHint').querySelector('code').textContent=c.nut_ups+'@'+location.hostname}

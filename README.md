@@ -283,6 +283,20 @@ MONITOR multiplus@192.168.1.50 1 monuser secret secondary
 The derived status is also published to MQTT as `ups_status` (HA sensor
 "UPS Status") and shown on the dashboard.
 
+**apcupsd network server:** the device also answers the apcupsd NIS protocol
+on TCP port **3551** — `apcaccess -h <device-ip>`, apcupsd slaves
+(`UPSCABLE ether`, `UPSTYPE net`, `DEVICE <device-ip>:3551`) and the Home
+Assistant "APC UPS Daemon" integration. Reported fields: `STATUS`
+(`ONLINE` / `ONBATT` + `LOWBATT`, `OVERLOAD`; `COMMLOST` without VE.Bus sync),
+`STATFLAG`, `LINEV`, `OUTPUTV`, `LINEFREQ`, `BATTV`, `BCHARGE`, `MBATTCHG`,
+`ITEMP`, `LOADPCT`/`NOMPOWER` (with a nominal power set), `TIMELEFT` (with a
+battery capacity set), `NUMXFERS`, `TONBATT`, `CUMONBATT`, `SERIALNO`,
+`FIRMWARE` and NTP-based `DATE`/`STARTTIME`.
+
+Set the usable battery capacity (Wh) in `/admin/` to get a runtime estimate
+(`TIMELEFT`, NUT `battery.runtime`) = capacity × SoC ÷ output power. Without
+it, apcupsd slaves decide on `BCHARGE` and the `LOWBATT` flag only.
+
 **Robustness:**
 
 - Task watchdog on `loop()` (30 s) — a stalled loop reboots the board.
@@ -296,6 +310,13 @@ The derived status is also published to MQTT as `ups_status` (HA sensor
   setpoint returns to 0 W.
 - The last reset reason (power-on, watchdog, brownout, …) is shown on the
   dashboard and in the serial log.
+
+**Firmware updates over the network:** upload `.pio/build/mqtt_ha/firmware.bin`
+in `/admin/` → System, or let PlatformIO do it:
+
+```bash
+VEBUS_ADMIN_PASS=yourpassword pio run -e mqtt_ha_ota -t upload --upload-port 192.168.1.50
+```
 
 **MQTT topics:** state → `<prefix>/state` (JSON, keys as in the table below),
 availability → `<prefix>/status`, commands → `<prefix>/<command>/set`.
