@@ -243,10 +243,42 @@ a web admin password. Values are persisted to NVS.
 | Page | Access | Content |
 |------|--------|---------|
 | `/` | public, read-only | live values, VE.Bus/MQTT/WiFi status, 1 h / 6 h / 24 h charts (power, battery voltage, SoC; 1-minute averages kept in RAM) |
-| `/admin/` | HTTP basic auth, user `admin`, default password `vebus` | ESS setpoint, switch state, battery-neutral mode, charge buttons, MQTT settings, ESS fail-safe timeout, admin password, OTA firmware upload, reboot, WiFi reset |
+| `/admin/` | HTTP basic auth, user `admin`, default password `vebus` | ESS setpoint, switch state, battery-neutral mode, charge buttons, MQTT settings, ESS fail-safe timeout, NUT settings, admin password, OTA firmware upload, reboot, WiFi reset |
 
 Change the default password — the dashboard shows a warning until you do.
 JSON endpoints: `/api/state`, `/api/history`.
+
+**Network UPS Tools (NUT) server:** the device answers the upsd network
+protocol on TCP port **3493**, so anything that speaks NUT can monitor the
+Multiplus as a UPS and shut down cleanly on low battery — Synology/QNAP
+("Network UPS server"), TrueNAS, Proxmox/Linux `upsmon`, WinNUT, and the
+Home Assistant NUT integration. Use `multiplus@<device-ip>` (the UPS name is
+configurable).
+
+| NUT variable | Source |
+|---|---|
+| `ups.status` | `OL` (mains present: mains LED or mains voltage) / `OB DISCHRG`, plus `CHRG`, `LB`, `OVER`, `OFF`, `FSD` |
+| `battery.charge`, `battery.charge.low` | SoC (RAM 13), low-battery threshold from settings |
+| `battery.voltage`, `battery.current` | battery voltage / current |
+| `input.voltage/current/frequency/realpower` | mains side |
+| `output.voltage/current/frequency`, `ups.realpower` | AC-out side |
+| `ups.load`, `ups.realpower.nominal` | only when a nominal power is configured |
+| `ups.temperature`, `ups.firmware`, `device.*` | temperature, VE.Bus firmware, identification |
+
+`LB` (the state that makes clients shut down) is raised when the Multiplus
+low-battery LED is on or blinking, or when SoC ≤ the configured threshold
+(default 20 %). Without VE.Bus sync every variable answers `ERR DATA-STALE`,
+which NUT clients treat as "UPS data unavailable" rather than "on battery".
+Optional username/password (checked for `LOGIN`/`PRIMARY`/`FSD`) can be set
+in `/admin/`; with an empty user any credentials are accepted. The server is
+read-only (no `SET`/`INSTCMD`). Example `upsmon.conf` line:
+
+```
+MONITOR multiplus@192.168.1.50 1 monuser secret secondary
+```
+
+The derived status is also published to MQTT as `ups_status` (HA sensor
+"UPS Status") and shown on the dashboard.
 
 **Robustness:**
 
@@ -267,7 +299,7 @@ availability → `<prefix>/status`, commands → `<prefix>/<command>/set`.
 Versions before 1.2 published one topic per value; HA picks up the new
 state topic automatically through discovery (entity ids are unchanged).
 
-**Sensors (23 + diagnostics: WiFi signal, uptime, free heap, firmware version):**
+**Sensors (24 + diagnostics: WiFi signal, uptime, free heap, firmware version):**
 
 | Sensor | JSON key | Source | Unit |
 |--------|----------|--------|------|
@@ -294,6 +326,7 @@ state topic automatically through discovery (entity ids are unchanged).
 | Device State | `device_state` | `requestDeviceState()` | — |
 | Charge Sub-State | `charge_sub_state` | `getDeviceSubState()` | — |
 | Checksum Faults | `checksum_faults` | `getChecksumFaults()` | — |
+| UPS Status | `ups_status` | derived NUT status (`OL`, `OB DISCHRG LB`, …, `UNKNOWN` without sync) | — |
 
 **Binary Sensors (2):**
 

@@ -10,6 +10,8 @@
  *              user "admin", default password "vebus" — change it!)
  * - Self-healing: task watchdog on the main loop, WiFi supervisor, MQTT
  *   reconnect with short timeouts, optional ESS setpoint fail-safe.
+ * - NUT server (Network UPS Tools, TCP 3493): NAS/servers/HA can monitor
+ *   the Multiplus as a UPS and shut down on low battery.
  *
  * Hardware: LilyGo T-CAN485 (ESP32, MAX13487E RS485 transceiver)
  *
@@ -28,6 +30,7 @@
 #include <stdarg.h>
 #include <VEBus.h>
 #include "web_ui.h"
+#include "nut_server.h"
 
 #ifndef ESP_ARDUINO_VERSION_MAJOR
 #define ESP_ARDUINO_VERSION_MAJOR 2
@@ -46,6 +49,8 @@
 #define DEFAULT_TOPIC_PREFIX  "vebus/multiplus"
 #define DEFAULT_ADMIN_PASS    "vebus"
 #define ADMIN_USER            "admin"
+#define DEFAULT_NUT_UPS       "multiplus"
+#define DEFAULT_LOW_SOC       20      // % - below this NUT reports LB (low battery)
 #define AP_SSID               "VEBus-Setup"
 #define AP_PASS               ""    // open AP
 
@@ -87,6 +92,12 @@ struct Config {
     char     prefix[64];
     char     adminPass[32];
     uint16_t essTimeoutS;       // 0 = off; else setpoint falls back to 0 W
+    bool     nutEnabled;
+    char     nutUps[16];        // UPS name clients use, e.g. multiplus@<ip>
+    char     nutUser[32];       // empty = no authentication
+    char     nutPass[32];
+    uint8_t  lowSoc;            // % SoC that triggers LB (0 = LED only)
+    uint16_t nominalW;          // for ups.load (0 = don't report)
 } cfg;
 
 WiFiClient   wifiClient;
@@ -95,6 +106,7 @@ VEBus        vebus;
 WiFiManager  wm;
 Preferences  prefs;
 WebServer    server(80);
+NutServer    nut;
 
 char hostName[32];              // deviceId sanitised for DHCP / mDNS
 
@@ -102,6 +114,7 @@ char hostName[32];              // deviceId sanitised for DHCP / mDNS
 struct {
     int16_t mainsV, mainsA, invV, invA, outW, mainsW;
     int16_t batA, soc, mainsPeriod, invPeriod;
+    bool    socValid;           // at least one SoC reading received
 } live;
 
 int16_t  g_essPower       = 0;
@@ -235,7 +248,14 @@ static void loadConfig()
     strlcpy(cfg.prefix,    prefs.getString("prefix", DEFAULT_TOPIC_PREFIX).c_str(), sizeof(cfg.prefix));
     strlcpy(cfg.adminPass, prefs.getString("admin",  DEFAULT_ADMIN_PASS).c_str(),   sizeof(cfg.adminPass));
     cfg.essTimeoutS =      prefs.getUShort("esstmo", 0);
+    cfg.nutEnabled  =      prefs.getBool("nut", true);
+    strlcpy(cfg.nutUps,    prefs.getString("nutups",  DEFAULT_NUT_UPS).c_str(), sizeof(cfg.nutUps));
+    strlcpy(cfg.nutUser,   prefs.getString("nutuser", "").c_str(),              sizeof(cfg.nutUser));
+    strlcpy(cfg.nutPass,   prefs.getString("nutpass", "").c_str(),              sizeof(cfg.nutPass));
+    cfg.lowSoc      =      prefs.getUChar("lowsoc",   DEFAULT_LOW_SOC);
+    cfg.nominalW    =      prefs.getUShort("nomw",    0);
     prefs.end();
+    if (!cfg.nutUps[0]) strlcpy(cfg.nutUps, DEFAULT_NUT_UPS, sizeof(cfg.nutUps));
     if (cfg.mqttPort == 0) cfg.mqttPort = DEFAULT_MQTT_PORT;
     if (!cfg.adminPass[0]) strlcpy(cfg.adminPass, DEFAULT_ADMIN_PASS, sizeof(cfg.adminPass));
 }
@@ -251,6 +271,12 @@ static void saveConfig()
     prefs.putString("prefix", cfg.prefix);
     prefs.putString("admin",  cfg.adminPass);
     prefs.putUShort("esstmo", cfg.essTimeoutS);
+    prefs.putBool("nut",       cfg.nutEnabled);
+    prefs.putString("nutups",  cfg.nutUps);
+    prefs.putString("nutuser", cfg.nutUser);
+    prefs.putString("nutpass", cfg.nutPass);
+    prefs.putUChar("lowsoc",   cfg.lowSoc);
+    prefs.putUShort("nomw",    cfg.nominalW);
     prefs.end();
 }
 
@@ -333,6 +359,82 @@ static bool handleCommand(const char *cmd, const char *arg, const char *src)
 }
 
 // =======================================================================
+// UPS view of the Multiplus (used by NUT, MQTT and the dashboard)
+// =======================================================================
+static bool mainsPresent()
+{
+    // LED "mains on" (steady or blinking) or a measurable mains voltage
+    byte led = vebus.getLEDon() | vebus.getLEDblink();
+    return (led & VEBUS_LED_MAINS_ON) || live.mainsV > 150;
+}
+
+static bool lowBattery()
+{
+    byte led = vebus.getLEDon() | vebus.getLEDblink();
+    if (led & VEBUS_LED_LOW_BATTERY) return true;
+    return cfg.lowSoc && live.socValid && live.soc <= cfg.lowSoc;
+}
+
+// NUT-style status string, e.g. "OL CHRG", "OB DISCHRG LB"
+static void upsStatus(char *out, size_t n)
+{
+    Buf b(out, n);
+    if (vebus.hasNoSync()) { b.add("UNKNOWN"); return; }   // no data from the Multiplus
+    bool mains = mainsPresent();
+    b.add(mains ? "OL" : "OB");
+    if (mains && live.batA > 0) b.add(" CHRG");
+    if (!mains)                 b.add(" DISCHRG");
+    if (lowBattery())           b.add(" LB");
+    if ((vebus.getLEDon() | vebus.getLEDblink()) & VEBUS_LED_OVERLOAD) b.add(" OVER");
+    if (g_devState == VEBUS_STATE_OFF || g_devState == VEBUS_STATE_DOWN) b.add(" OFF");
+    if (nut.fsd)                b.add(" FSD");
+}
+
+// Variables served over NUT. Returns false (-> ERR DATA-STALE) without VE.Bus sync.
+static bool nutVars(std::function<void(const char *, const char *)> emit)
+{
+    char v[32];
+    emit("device.mfr",     "Victron Energy");
+    emit("device.model",   "MultiPlus");
+    emit("device.type",    "ups");
+    emit("driver.name",    "vebus-esp32");
+    emit("driver.version", "1.2.0");
+    emit("ups.mfr",        "Victron Energy");
+    emit("ups.model",      "MultiPlus");
+    if (g_fwVersion[0]) emit("ups.firmware", g_fwVersion);
+    upsStatus(v, sizeof(v));                                      emit("ups.status", v);
+    snprintf(v, sizeof(v), "%d", live.outW);                      emit("ups.realpower", v);
+    if (cfg.nominalW) {
+        snprintf(v, sizeof(v), "%u", cfg.nominalW);               emit("ups.realpower.nominal", v);
+        snprintf(v, sizeof(v), "%ld", constrain(live.outW * 100L / cfg.nominalW, 0L, 200L));
+        emit("ups.load", v);
+    }
+    snprintf(v, sizeof(v), "%.1f", vebus.getTemp());              emit("ups.temperature", v);
+    if (live.socValid) {
+        snprintf(v, sizeof(v), "%d", (int)constrain(live.soc, 0, 100)); emit("battery.charge", v);
+    }
+    snprintf(v, sizeof(v), "%u", cfg.lowSoc);                     emit("battery.charge.low", v);
+    snprintf(v, sizeof(v), "%.2f", vebus.getBatVolt());           emit("battery.voltage", v);
+    snprintf(v, sizeof(v), "%d", live.batA);                      emit("battery.current", v);
+    snprintf(v, sizeof(v), "%d", live.mainsV);                    emit("input.voltage", v);
+    snprintf(v, sizeof(v), "%d", live.mainsA);                    emit("input.current", v);
+    snprintf(v, sizeof(v), "%.1f", periodToHz(live.mainsPeriod)); emit("input.frequency", v);
+    snprintf(v, sizeof(v), "%d", live.mainsW);                    emit("input.realpower", v);
+    snprintf(v, sizeof(v), "%d", live.invV);                      emit("output.voltage", v);
+    snprintf(v, sizeof(v), "%d", live.invA);                      emit("output.current", v);
+    snprintf(v, sizeof(v), "%.1f", periodToHz(live.invPeriod));   emit("output.frequency", v);
+    return !vebus.hasNoSync();
+}
+
+static void applyNutConfig()
+{
+    nut.upsName = cfg.nutUps;
+    nut.user    = cfg.nutUser;
+    nut.pass    = cfg.nutPass;
+    if (!cfg.nutEnabled) nut.end();   // started from loop() once WiFi is up
+}
+
+// =======================================================================
 // State JSON — published to MQTT and served to the dashboard
 // =======================================================================
 static void buildStateJson(Buf &j)
@@ -359,6 +461,9 @@ static void buildStateJson(Buf &j)
     j.add("\"sync\":\"%s\",\"dc_allows_inv\":\"%s\",\"switch_state\":\"%s\",",
           vebus.hasNoSync() ? "OFF" : "ON",
           vebus.dcLevelAllowsInverting() ? "ON" : "OFF", switchStateName());
+    char ups[32];
+    upsStatus(ups, sizeof(ups));
+    j.add("\"ups_status\":\"%s\",\"nut_clients\":%u,", ups, (unsigned)nut.clientCount());
     j.add("\"firmware_version\":\"%s\",\"rssi\":%d,\"uptime\":%lu,\"free_heap\":%u}",
           g_fwVersion, (int)WiFi.RSSI(), (unsigned long)(millis() / 1000),
           (unsigned)ESP.getFreeHeap());
@@ -421,6 +526,7 @@ static const Entity ENTITIES[] = {
     {"sensor", "vebus_ac_in_cfg",    false, "AC Input Config",   "ac_in_config",     nullptr, ""},
     {"sensor", "vebus_dev_state",    false, "Device State",      "device_state",     nullptr, ""},
     {"sensor", "vebus_charge_sub",   false, "Charge Sub-State",  "charge_sub_state", nullptr, ""},
+    {"sensor", "vebus_ups_status",   false, "UPS Status",        "ups_status",       nullptr, ""},
     // Diagnostics
     {"sensor", "vebus_chksum",     false, "Checksum Faults",   "checksum_faults",  nullptr, DIAG},
     {"sensor", "vebus_fw",         false, "Firmware Version",  "firmware_version", nullptr, DIAG},
@@ -621,8 +727,12 @@ static void handleGetConfig()
     j.add(",\"port\":%u,\"user\":", cfg.mqttPort); j.str(cfg.mqttUser);
     j.add(",\"pass_set\":%s,\"device\":", cfg.mqttPass[0] ? "true" : "false"); j.str(cfg.deviceId);
     j.add(",\"prefix\":"); j.str(cfg.prefix);
-    j.add(",\"ess_timeout\":%u,\"default_pw\":%s}", cfg.essTimeoutS,
+    j.add(",\"ess_timeout\":%u,\"default_pw\":%s", cfg.essTimeoutS,
           isDefaultPassword() ? "true" : "false");
+    j.add(",\"nut\":%s,\"nut_ups\":", cfg.nutEnabled ? "true" : "false"); j.str(cfg.nutUps);
+    j.add(",\"nut_user\":"); j.str(cfg.nutUser);
+    j.add(",\"nut_pass_set\":%s,\"low_soc\":%u,\"nominal_w\":%u}",
+          cfg.nutPass[0] ? "true" : "false", cfg.lowSoc, cfg.nominalW);
     sendJson(payloadBuf);
 }
 
@@ -647,6 +757,17 @@ static void handlePostConfig()
         strlcpy(cfg.prefix, server.arg("prefix").c_str(), sizeof(cfg.prefix));
     if (server.hasArg("ess_timeout"))
         cfg.essTimeoutS = (uint16_t)constrain(server.arg("ess_timeout").toInt(), 0, 65535);
+    if (server.hasArg("nut_ups")) {           // NUT fields are posted together
+        cfg.nutEnabled = server.hasArg("nut");
+        if (server.arg("nut_ups").length())
+            strlcpy(cfg.nutUps, server.arg("nut_ups").c_str(), sizeof(cfg.nutUps));
+        strlcpy(cfg.nutUser, server.arg("nut_user").c_str(), sizeof(cfg.nutUser));
+        if (server.arg("nut_pass").length())
+            strlcpy(cfg.nutPass, server.arg("nut_pass").c_str(), sizeof(cfg.nutPass));
+        if (!cfg.nutUser[0]) cfg.nutPass[0] = '\0';
+        cfg.lowSoc   = (uint8_t)constrain(server.arg("low_soc").toInt(), 0, 100);
+        cfg.nominalW = (uint16_t)constrain(server.arg("nominal_w").toInt(), 0, 65535);
+    }
     if (server.hasArg("admin_pass")) {
         String p = server.arg("admin_pass");
         if (p.length() >= 4 && p.length() < sizeof(cfg.adminPass))
@@ -659,6 +780,7 @@ static void handlePostConfig()
     saveConfig();
     makeHostName();
     applyMqttConfig();
+    applyNutConfig();
     Serial.println("[web] config saved — reconnecting MQTT");
     sendJson("{\"ok\":true}");
 }
@@ -890,6 +1012,14 @@ void setup()
     mqtt.setKeepAlive(30);
     mqtt.setCallback(mqttCallback);
 
+    // NUT server (started from loop() once WiFi is up)
+    nut.upsDesc = "Victron MultiPlus (VE.Bus)";
+    nut.vars    = nutVars;
+    applyNutConfig();
+    if (cfg.nutEnabled)
+        Serial.printf("[nut] UPS '%s' on port 3493%s\n", cfg.nutUps,
+                      cfg.nutUser[0] ? " (auth required)" : "");
+
     histLastMs = millis();
     setupTaskWatchdog();
 }
@@ -914,6 +1044,10 @@ void loop()
 
     connectMqtt();
     mqtt.loop();
+
+    if (cfg.nutEnabled && WiFi.status() == WL_CONNECTED) nut.begin();   // no-op once running
+    nut.loop();
+    if (nut.fsd && mainsPresent() && !lowBattery()) nut.fsd = false;    // power is back
 
     // Discovery, one entity per pass
     if (g_discIdx < ENTITY_COUNT && mqtt.connected())
@@ -995,7 +1129,7 @@ void loop()
                                             break;
             case VEBUS_RAM_MAINS_POWER:     live.mainsW = v; break;
             case VEBUS_RAM_IBAT:            live.batA   = v; break;
-            case VEBUS_RAM_CHARGE_STATE:    live.soc    = v; break;
+            case VEBUS_RAM_CHARGE_STATE:    live.soc    = v; live.socValid = true; break;
             case VEBUS_RAM_MAINS_PERIOD:    live.mainsPeriod = v; break;
             case VEBUS_RAM_INVERTER_PERIOD: live.invPeriod   = v; break;
             default: break;

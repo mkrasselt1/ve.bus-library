@@ -32,7 +32,7 @@
     {
       "name": "MQTT Home Assistant",
       "base": "examples/mqtt_ha",
-      "files": ["main.cpp", "web_ui.h"]
+      "files": ["main.cpp", "web_ui.h", "nut_server.h"]
     }
   ]
 }
