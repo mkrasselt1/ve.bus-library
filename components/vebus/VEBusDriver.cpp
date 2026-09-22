@@ -237,7 +237,7 @@ void VEBus::_run()
             VEBusCmd cmd;
             if (xQueuePeek(_cmdQueue, &cmd, 0) == pdTRUE)
             {
-                if (millis() > _synctime + TX_DELAY_MS)
+                if ((uint32_t)(millis() - _synctime) > TX_DELAY_MS)
                 {
                     _syncrxed = false;
                     xQueueReceive(_cmdQueue, &cmd, 0);
@@ -250,7 +250,7 @@ void VEBus::_run()
             }
         }
 
-        if (millis() > _synctime + 1000)
+        if ((uint32_t)(millis() - _synctime) > 1000)
         {
             _nosync   = true;
             _synctime = millis();
@@ -269,6 +269,9 @@ void VEBus::_processRx()
     while (Serial1.available())
     {
         char c = Serial1.read();
+        // Line noise or a missed 0xFF terminator must not run past the
+        // frame buffer — drop the partial frame and resync.
+        if (_frp >= sizeof(_frbuf1)) _frp = 0;
         _frbuf1[_frp++] = c;
 
         if (c == 0x55) {
@@ -528,10 +531,11 @@ int VEBus::_destuffFAtoFF(char *out, const char *in, int len)
 {
     int j = 0;
     for (int i = 0; i < 4; i++) out[j++] = in[i];
-    for (int i = 4; i < len; i++)
+    for (int i = 4; i < len && j < (int)sizeof(_frbuf2) - 1; i++)
     {
         byte c = (byte)in[i];
         if (c == 0xFA) {
+            if (i + 1 >= len) break;
             c = (byte)in[++i];
             if (c == 0xFF) {
                 out[j++] = 0xFA;

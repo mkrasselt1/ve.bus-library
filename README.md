@@ -38,6 +38,7 @@ Protocol reference and additional features derived from:
 - **Setting & RAM variable info** — query scale, offset, default, min, max
 - Decodes charger/inverter status, LED bitmask, DC current, temperature, AC input limits
 - Auto-direction support for MAX13487E transceiver
+- Robust frame receiver — line noise or truncated frames cannot overflow buffers
 - Comprehensive constants for RAM IDs, setting IDs, device states, LED/switch bitmasks
 
 ## ESS Setpoint Semantics
@@ -231,49 +232,77 @@ Full example with automatic no-sync recovery and interactive serial commands:
 Publishes all Multiplus data as HA entities. RAM variables are read in two
 batches per cycle (6 + 4 IDs), device state is polled once per cycle.
 
-**Self-configuration UI (WiFiManager):** on first boot the device starts an
-open AP named `VEBus-Setup`. Connect to it, the captive portal asks for WiFi
-credentials plus the MQTT host/port/user/pass/device-id/topic-prefix. Values
-are persisted to NVS. After the device joins WiFi the same config form stays
-reachable at `http://<device-ip>/` so you can edit MQTT settings any time
-without re-flashing.
+**First setup (WiFiManager):** on first boot (or when the saved WiFi is not
+reachable) the device opens an AP named `VEBus-Setup`. The captive portal asks
+for WiFi credentials, the MQTT host/port/user/pass/device-id/topic-prefix and
+a web admin password. Values are persisted to NVS.
 
-**Sensors (23):**
+**Web UI:** after joining WiFi the device serves
+`http://<device-ip>/` (also `http://<device-id>.local/` via mDNS):
 
-| Sensor | Source | Unit |
-|--------|--------|------|
-| Battery Voltage | `getBatVolt()` | V |
-| AC Power | `getACPower()` | W |
-| DC Current | `getDCCurrent()` | A |
-| Temperature | `getTemp()` | °C |
-| Charger Status | `getChargerStatus()` | — |
-| ESS Power | local setpoint (virtual setpoint when virtual mode on) | W |
-| Effective ESS Power | what's actually sent to the inverter | W |
-| Mains Voltage | RAM ID 0 | V |
-| Mains Current | RAM ID 1 | A |
-| Inverter Voltage | RAM ID 2 | V |
-| Inverter Current | RAM ID 3 | A |
-| Output Power | RAM ID 16 | W |
-| Mains Power | RAM ID 15 | W |
-| Battery Current | RAM ID 5 | A |
-| State of Charge | RAM ID 13 | % |
-| Mains Frequency | RAM ID 8 | Hz |
-| Inverter Frequency | RAM ID 7 | Hz |
-| LED On / LED Blink | `getLEDon()` / `getLEDblink()` | — |
-| AC Input Min / Max / Actual | `getMin/Max/ActInputCurrentLimit()` | A |
-| AC Input Config | `getAcInputConfiguration()` | — |
-| Device State | `requestDeviceState()` | — |
-| Charge Sub-State | `getDeviceSubState()` | — |
-| Checksum Faults | `getChecksumFaults()` | — |
+| Page | Access | Content |
+|------|--------|---------|
+| `/` | public, read-only | live values, VE.Bus/MQTT/WiFi status, 1 h / 6 h / 24 h charts (power, battery voltage, SoC; 1-minute averages kept in RAM) |
+| `/admin/` | HTTP basic auth, user `admin`, default password `vebus` | ESS setpoint, switch state, battery-neutral mode, charge buttons, MQTT settings, ESS fail-safe timeout, admin password, OTA firmware upload, reboot, WiFi reset |
+
+Change the default password — the dashboard shows a warning until you do.
+JSON endpoints: `/api/state`, `/api/history`.
+
+**Robustness:**
+
+- Task watchdog on `loop()` (30 s) — a stalled loop reboots the board.
+- WiFi supervisor — reassociates every 30 s while offline, reboots after 10 min.
+- WiFi modem sleep disabled (keeps the web UI responsive).
+- MQTT: 5 s socket timeout, reconnect every 5 s, HA discovery sent one entity
+  per loop pass and re-sent when HA restarts (`homeassistant/status`).
+- One JSON state message per cycle (`<prefix>/state`) instead of ~30 single
+  publishes — far less blocking on a slow WiFi link.
+- Optional ESS fail-safe: if no new setpoint arrives within N seconds the
+  setpoint returns to 0 W.
+- The last reset reason (power-on, watchdog, brownout, …) is shown on the
+  dashboard and in the serial log.
+
+**MQTT topics:** state → `<prefix>/state` (JSON, keys as in the table below),
+availability → `<prefix>/status`, commands → `<prefix>/<command>/set`.
+Versions before 1.2 published one topic per value; HA picks up the new
+state topic automatically through discovery (entity ids are unchanged).
+
+**Sensors (23 + diagnostics: WiFi signal, uptime, free heap, firmware version):**
+
+| Sensor | JSON key | Source | Unit |
+|--------|----------|--------|------|
+| Battery Voltage | `bat_volt` | `getBatVolt()` | V |
+| AC Power | `ac_power` | `getACPower()` | W |
+| DC Current | `dc_current` | `getDCCurrent()` | A |
+| Temperature | `temp` | `getTemp()` | °C |
+| Charger Status | `charger_status` | `getChargerStatus()` | — |
+| ESS Power | `ess_power` | local setpoint (virtual setpoint when virtual mode on) | W |
+| Effective ESS Power | `ess_power_eff` | what's actually sent to the inverter | W |
+| Mains Voltage | `mains_voltage` | RAM ID 0 | V |
+| Mains Current | `mains_current` | RAM ID 1 | A |
+| Inverter Voltage | `inv_voltage` | RAM ID 2 | V |
+| Inverter Current | `inv_current` | RAM ID 3 | A |
+| Output Power | `output_power` | RAM ID 16 | W |
+| Mains Power | `mains_power` | RAM ID 15 | W |
+| Battery Current | `bat_current` | RAM ID 5 | A |
+| State of Charge | `soc` | RAM ID 13 | % |
+| Mains Frequency | `mains_freq` | RAM ID 8 | Hz |
+| Inverter Frequency | `inv_freq` | RAM ID 7 | Hz |
+| LED On / LED Blink | `led_on` / `led_blink` | `getLEDon()` / `getLEDblink()` | — |
+| AC Input Min / Max / Actual | `ac_in_min` / `ac_in_max` / `ac_in_actual` | `getMin/Max/ActInputCurrentLimit()` | A |
+| AC Input Config | `ac_in_config` | `getAcInputConfiguration()` | — |
+| Device State | `device_state` | `requestDeviceState()` | — |
+| Charge Sub-State | `charge_sub_state` | `getDeviceSubState()` | — |
+| Checksum Faults | `checksum_faults` | `getChecksumFaults()` | — |
 
 **Binary Sensors (2):**
 
-| Sensor | Source |
-|--------|--------|
-| VE.Bus Sync | `hasNoSync()` |
-| DC Allows Inverting | `dcLevelAllowsInverting()` |
+| Sensor | JSON key | Source |
+|--------|----------|--------|
+| VE.Bus Sync | `sync` | `hasNoSync()` |
+| DC Allows Inverting | `dc_allows_inv` | `dcLevelAllowsInverting()` |
 
-**Controls (9):**
+**Controls (8):**
 
 | Entity | Type | Details |
 |--------|------|---------|
@@ -286,7 +315,13 @@ without re-flashing.
 | Force Float | Button | — |
 | Force Equalise | Button | — |
 
-Firmware version is published once (retained) at MQTT connect.
+**Diagnostics:** `firmware_version` (VE.Bus firmware, requested at MQTT connect),
+`rssi` (dBm), `uptime` (s), `free_heap` (bytes).
+
+Commands: publish to `<prefix>/<command>/set` — `ess_power` (W),
+`switch_state` (`on`/`off`/`charger_only`/`inverter_only`), `virtual_mode`
+(`ON`/`OFF`), `wakeup`, `sleep`, `force_absorption`, `force_float`,
+`force_equalise` (any payload).
 
 ### `raw_test` — RS485 hardware test
 
