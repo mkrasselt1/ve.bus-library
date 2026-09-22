@@ -267,8 +267,11 @@ configurable).
 
 `LB` (the state that makes clients shut down) is raised when the Multiplus
 low-battery LED is on or blinking, or when SoC ≤ the configured threshold
-(default 20 %). Without VE.Bus sync every variable answers `ERR DATA-STALE`,
-which NUT clients treat as "UPS data unavailable" rather than "on battery".
+(default 20 %). Without VE.Bus sync `GET VAR` answers `ERR DATA-STALE`, which
+NUT clients (upsmon, NAS) treat as "communication lost" rather than "on
+battery". `LIST VAR` still returns all variables (`ups.status` = `UNKNOWN`) so
+integrations such as Home Assistant's can be set up before the inverter is
+connected.
 Optional username/password (checked for `LOGIN`/`PRIMARY`/`FSD`) can be set
 in `/admin/`; with an empty user any credentials are accepted. The server is
 read-only (no `SET`/`INSTCMD`). Example `upsmon.conf` line:

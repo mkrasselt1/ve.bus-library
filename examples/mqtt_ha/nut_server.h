@@ -298,11 +298,14 @@ private:
 
         if (!strcasecmp(what, "VAR")) {
             _out = "BEGIN LIST VAR "; _out += upsName; _out += '\n';
-            bool fresh = vars([&](const char *k, const char *v) {
+            // Unlike upsd, LIST VAR is served even when stale (ups.status then
+            // reads UNKNOWN) so clients such as the Home Assistant NUT
+            // integration can be set up before the inverter is connected.
+            // GET VAR — what upsmon/NAS clients poll — still reports DATA-STALE.
+            vars([&](const char *k, const char *v) {
                 _out += "VAR "; _out += upsName; _out += ' '; _out += k; _out += ' ';
                 _quote(_out, v); _out += '\n';
             });
-            if (!fresh) { _send(c, "ERR DATA-STALE\n"); return; }
             _out += "END LIST VAR "; _out += upsName; _out += '\n';
             _send(c, _out);
         }
