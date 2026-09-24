@@ -27,7 +27,11 @@ Protocol reference and additional features derived from:
 
 ## Features
 
-- Internal FreeRTOS task handles all RS485 RX/TX with correct sync timing
+- Internal FreeRTOS task (core 1, away from the WiFi stack) handles all RS485
+  RX/TX: it transmits only inside a narrow window after the sync frame
+  (8.0–9.5 ms) and skips a sync rather than sending late
+- UART is configured before the transceiver is enabled, and `setTxEnabled(false)`
+  mutes the bus before an OTA update or restart — the bus never sees garbage
 - Thread-safe command queue — call any command from any core
 - **ESS power setpoint** with automatic acknowledgement tracking
 - **Flexible RAM variable reading** — read any combination of up to 6 RAM variables per request
@@ -40,6 +44,16 @@ Protocol reference and additional features derived from:
 - Auto-direction support for MAX13487E transceiver
 - Robust frame receiver — line noise or truncated frames cannot overflow buffers
 - Comprehensive constants for RAM IDs, setting IDs, device states, LED/switch bitmasks
+
+**Optional add-ons (header-only)** — only compiled into your firmware when you
+`#include` them, so sketches that don't use them carry no extra code:
+
+| Header | Purpose |
+|--------|---------|
+| `VEBusScaler.h` | raw RAM values → V / A / W / % (measured MultiPlus defaults) |
+| `VEBusUps.h` | UPS view: on line / on battery / low battery, runtime estimate, mains-failure statistics |
+| `VEBusNutServer.h` | NUT (Network UPS Tools) server, TCP 3493 |
+| `VEBusApcupsdServer.h` | apcupsd network information server, TCP 3551 |
 
 **Ready-to-flash firmware** (`mqtt_ha` example): Home Assistant via MQTT
 auto-discovery, web dashboard with history charts, password-protected
@@ -55,6 +69,13 @@ The setpoint controls power exchange on the **AC-IN (grid) side**, not AC-OUT:
 | `+300` | Invert 300 W from battery toward grid (reduces import / feeds back) |
 | `-300` | Charge battery with 300 W from grid |
 | `0` | Standby — grid pass-through only |
+
+> **Keep setpoints within what the unit can deliver.** The charger of a small
+> MultiPlus (e.g. 48/800/9-16: 9 A ≈ 500 W) cannot follow a larger charge
+> setpoint. In battery-neutral mode the AC-out load is added on top of the
+> setpoint, so the value actually sent is larger than the one you set. If the
+> Multiplus powers critical loads (servers, network), change setpoints in
+> small steps and watch the system.
 
 ### Virtual Setpoint Mode (battery-neutral UPS)
 
@@ -133,8 +154,9 @@ VEBus vebus;
 
 void setup() {
     pinMode(19, OUTPUT);
-    digitalWrite(19, HIGH);      // enable MAX13487E (/SHDN HIGH)
+    digitalWrite(19, LOW);       // MAX13487E off until the UART is configured
     vebus.begin(21, 22, 17);    // RX, TX, /RE — LilyGo T-CAN485
+    digitalWrite(19, HIGH);      // now enable the transceiver (/SHDN HIGH)
 }
 
 void loop() {
@@ -168,6 +190,27 @@ if (vebus.hasRAMVarResponse()) {
     vebus.clearRAMVarResponse();
 }
 ```
+
+Values are raw integers. `VEBusScaler` converts them to real units:
+
+```cpp
+#include <VEBusScaler.h>
+VEBusScaler scaler(vebus);
+float volts = scaler.value(VEBUS_RAM_UMAINS_RMS, raw);   // 22499 → 224.99 V
+```
+
+| RAM variable | Default scale (measured on a MultiPlus) |
+|---|---|
+| voltages (0, 2, 4) | × 0.01 V |
+| AC currents (1, 3) | × 0.01 A |
+| battery current (5) | × 0.1 A |
+| state of charge (13) | × 0.5 % |
+| powers (14–19) | × 1 W |
+| mains / inverter period (7, 8) | unknown — frequency is reported as unknown |
+
+`scaler.queryDevice = true` asks the Multiplus for each scale/offset with
+`requestRAMVarInfo()`. It is **off by default**: it adds bus traffic and the
+replies have not been confirmed on real hardware.
 
 ### Reading and writing settings
 
@@ -242,7 +285,13 @@ A complete firmware for the T-CAN485:
 - firmware updates over the network, watchdogs and self-healing WiFi/MQTT
 
 RAM variables are read in two batches per cycle (6 + 4 IDs), device state is
-polled once per cycle.
+polled once per cycle, the VE.Bus firmware version once after the first sync.
+All values are converted to real units (`VEBusScaler`), and the UPS servers
+come from the library's optional headers (see
+[`ups_server`](#ups_server--minimal-network-ups) for the minimal version).
+
+The ESS setpoint and battery-neutral mode survive restarts and firmware
+updates (stored in NVS, written at most once a minute).
 
 | Port | Service |
 |------|---------|
@@ -265,7 +314,8 @@ a web admin password. Values are persisted to NVS.
 | `/admin/` | HTTP basic auth, user `admin`, default password `vebus` | ESS setpoint, switch state, battery-neutral mode, charge buttons, MQTT settings, ESS fail-safe timeout, NUT/apcupsd settings (UPS name, credentials, low-battery SoC, nominal power, battery capacity), admin password, OTA firmware upload, reboot, WiFi reset |
 
 Change the default password — the dashboard shows a warning until you do.
-JSON endpoints: `/api/state`, `/api/history`.
+JSON endpoints: `/api/state`, `/api/history`, and `/admin/api/debug`
+(read-only diagnostics: last VE.Bus responses, scale table).
 
 **Network UPS Tools (NUT) server:** the device answers the upsd network
 protocol on TCP port **3493**, so anything that speaks NUT can monitor the
@@ -328,7 +378,13 @@ it, apcupsd slaves decide on `BCHARGE` and the `LOWBATT` flag only.
 - Optional ESS fail-safe: if no new setpoint arrives within N seconds the
   setpoint returns to 0 W.
 - The last reset reason (power-on, watchdog, brownout, …) is shown on the
-  dashboard and in the serial log.
+  dashboard and in the serial log; after a watchdog reset or crash the
+  dashboard also names the part of the firmware that was running ("in mqtt",
+  "in web server", …).
+- Bus silence: the transceiver is enabled only after the UART is set up, and
+  every orderly restart (reboot button, OTA, WiFi supervisor) and the whole
+  OTA upload mute the bus first. No automatic wake-up while muted.
+- Web, NUT, apcupsd and mDNS servers are restarted after a WiFi reconnect.
 
 **Firmware updates over the network:** upload `.pio/build/mqtt_ha/firmware.bin`
 in `/admin/` → System, or let PlatformIO do it:
@@ -410,8 +466,17 @@ Commands: publish to `<prefix>/<command>/set` — `ess_power` (W),
 | HA "Wakeup"/"Sleep" buttons missing | HA may create them disabled — enable them on the device page |
 | NUT client: `ERR DATA-STALE` | no VE.Bus data yet; `LIST VAR` still works for setup |
 | NUT `battery.charge` / apcupsd `TIMELEFT` missing | only reported after the first SoC reading / with a battery capacity set; reload the HA integration afterwards |
+| Device reachable via MQTT but not on its old IP | DHCP gave it a new address — reserve a fixed IP in your router (NUT/apcupsd clients need a stable address) |
+| Frequency sensors "unknown", firmware version empty | expected: the period scale is not known and the Multiplus did not answer the version request |
+| Values jumped after updating from 1.2 (e.g. 22499 V → 224.99 V) | 1.2 published raw values; HA may offer to fix the statistics of these sensors |
 | Device unreachable after WiFi change | it reopens the `VEBus-Setup` AP after 30 s without WiFi at boot; reboots itself after 10 min offline |
 | Board rebooted, dashboard footer shows "task watchdog" | the main loop stalled for 30 s and the watchdog recovered it — please report with the serial log |
+
+### `ups_server` — minimal network UPS
+
+Only the library's UPS add-ons: NUT on port 3493 and apcupsd on port 3551, no
+MQTT and no web UI. Set WiFi credentials, nominal power and battery capacity at
+the top of `examples/ups_server/main.cpp`.
 
 ### `raw_test` — RS485 hardware test
 
@@ -431,8 +496,9 @@ external_components:
 The wrapper exposes a `vebus` hub plus `sensor`, `binary_sensor`, `number`, and
 `switch` platforms — see `examples/esphome_vebus.yaml` for the full config.
 
-The library's RS485 task runs on its own FreeRTOS core (configure with
-`core: 1`), so blocking serial I/O never touches ESPHome's main loop.
+The library's RS485 task runs in its own FreeRTOS task on core 1 (default,
+configurable with `core:`), so blocking serial I/O never touches ESPHome's
+main loop or the WiFi stack.
 
 ## PlatformIO
 
@@ -442,6 +508,7 @@ The `platformio.ini` at the repo root has environments for all examples:
 pio run -e basic_ess                 # Serial console ESS control
 pio run -e mqtt_ha -t upload         # MQTT/HA/NUT/apcupsd firmware via USB
 VEBUS_ADMIN_PASS=... pio run -e mqtt_ha_ota -t upload --upload-port <device-ip>   # same, over the network
+pio run -e ups_server -t upload      # minimal NUT + apcupsd UPS server
 pio run -e raw_test                  # RS485 hex dump
 ```
 
@@ -450,12 +517,20 @@ pio run -e raw_test                  # RS485 hex dump
 ### Initialisation
 
 ```cpp
-void begin(int rxPin, int txPin, int dePin, int core = 0);
+void begin(int rxPin, int txPin, int dePin, int core = 1);
+void setTxEnabled(bool enable);   // mute / resume transmitting
+bool isTxEnabled();
 ```
 
-Starts UART at 256000 baud and launches an internal FreeRTOS task on the
-specified core (default: 0). The task runs a tight loop with no delay to
-catch sync timing.
+Configures the UART at 256000 baud (TX driven to its idle level) and launches
+the RS485 task on the given core (default 1, away from WiFi on core 0).
+**Enable the RS485 transceiver only after `begin()` returns.** The task sends
+queued commands only 8.0–9.5 ms after a sync frame; a late task skips that
+sync. The ESS setpoint has its own slot, so the newest value always wins
+without discarding other queued requests.
+
+Call `setTxEnabled(false)` before an OTA update or restart; reception
+continues while muted.
 
 ### ESS Power
 
@@ -575,6 +650,10 @@ void    clearRAMVarInfoResponse();
 uint8_t getRAMVarInfoId();
 int16_t getRAMVarInfoScale();
 int16_t getRAMVarInfoOffset();
+
+// Decode scale/offset and convert a raw value:
+VEBusVarInfo vi = VEBusVarInfo::fromDevice(getRAMVarInfoScale(), getRAMVarInfoOffset());
+float value = vi.apply(raw);
 ```
 
 ### Broadcast Data (decoded from periodic Multiplus frames)
@@ -606,7 +685,34 @@ bool     hasNoSync();          // no sync frame for > 1 s
 bool     isAcked();            // last write command acknowledged
 void     clearAcked();
 uint32_t getChecksumFaults();  // RX checksum error counter
+
+// Diagnostics: last VEBUS_RESP_LOG (8) responses, oldest first
+uint8_t  getResponseLog(uint8_t index, uint8_t *out, uint8_t maxLen);
 ```
+
+### UPS add-ons (optional headers)
+
+```cpp
+#include <VEBusScaler.h>
+#include <VEBusUps.h>
+#include <VEBusNutServer.h>
+#include <VEBusApcupsdServer.h>
+
+VEBusScaler        scaler(vebus);
+VEBusUps           ups(vebus);
+VEBusNutServer     nut(ups);     // TCP 3493
+VEBusApcupsdServer apc(ups);     // TCP 3551
+
+// setup (after WiFi): ups.lowSocPct = 20; ups.nominalW = 2400; ups.batteryWh = 5000;
+//                     nut.begin(); apc.begin();
+// on a RAM response:  ups.set(id, scaler.value(id, raw));
+// loop:               scaler.loop(); ups.loop(); nut.loop(); apc.loop();
+```
+
+`VEBusUps` derives `mainsPresent()`, `lowBattery()`, `overload()`,
+`runtimeMinutes()`, `nutStatus()` and mains-failure statistics; the servers
+read everything from it. `nut.user`/`nut.pass` enable login checks,
+`nut.extraVars` adds your own variables.
 
 ## Constants Reference
 

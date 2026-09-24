@@ -29,11 +29,14 @@
 #include <Preferences.h>
 #include <PubSubClient.h>
 #include <esp_task_wdt.h>
+#include <esp_system.h>
 #include <stdarg.h>
 #include <VEBus.h>
 #include "web_ui.h"
-#include "nut_server.h"
-#include "apcupsd_server.h"
+#include <VEBusScaler.h>           // optional: raw RAM values → real units
+#include <VEBusUps.h>              // optional UPS add-ons of the library
+#include <VEBusNutServer.h>
+#include <VEBusApcupsdServer.h>
 #include <time.h>
 
 #ifndef ESP_ARDUINO_VERSION_MAJOR
@@ -112,17 +115,16 @@ VEBus        vebus;
 WiFiManager  wm;
 Preferences  prefs;
 WebServer    server(80);
-NutServer    nut;
-ApcupsdServer apc;
+VEBusScaler        scaler(vebus); // RAM scale/offset, queried from the Multiplus
+VEBusUps           ups(vebus);   // UPS view: status, runtime, statistics
+VEBusNutServer     nut(ups);     // NUT, TCP 3493
+VEBusApcupsdServer apc(ups);     // apcupsd, TCP 3551
 
 char hostName[32];              // deviceId sanitised for DHCP / mDNS
 
-// Live values from the extended RAM reads (raw, as reported by the device)
-struct {
-    int16_t mainsV, mainsA, invV, invA, outW, mainsW;
-    int16_t batA, soc, mainsPeriod, invPeriod;
-    bool    socValid;           // at least one SoC reading received
-} live;
+// Live values from the extended RAM reads (real units) — stored in the UPS
+// helper so NUT/apcupsd see them too.
+VEBusUpsData &live = ups.data;
 
 int16_t  g_essPower       = 0;
 uint32_t g_lastEssCmdMs   = 0;
@@ -135,15 +137,25 @@ bool     g_publishNow     = false;
 uint8_t  g_discIdx        = 0xFF;    // next discovery entity (0xFF = done)
 uint32_t g_restartAtMs    = 0;
 bool     g_otaAuthed      = false;
+bool     g_essDirty       = false;   // ESS setpoint / virtual mode not yet in NVS
+uint32_t g_essSavedMs     = 0;
 
-// Mains-failure bookkeeping (apcupsd TONBATT / CUMONBATT / NUMXFERS)
-bool     g_onBatt         = false;
-uint32_t g_onBattSinceMs  = 0;
-uint32_t g_cumOnBattS     = 0;
-uint32_t g_numXfers       = 0;
-uint32_t g_bootEpoch      = 0;       // wall clock at boot, once NTP synced
+// Breadcrumb: which part of loop() was running. Survives a watchdog reset
+// (RTC memory) so the dashboard can show where the firmware got stuck.
+enum Stage : uint8_t { ST_NONE, ST_WIFI, ST_WEB, ST_MQTT, ST_DISCOVERY, ST_UPS,
+                       ST_VEBUS, ST_PUBLISH, ST_HISTORY, ST_SERIAL, ST_OTA };
+static const char *STAGE_NAMES[] = { "-", "wifi", "web server", "mqtt", "ha discovery",
+                                     "nut/apcupsd", "ve.bus", "mqtt publish", "history",
+                                     "serial", "ota" };
+RTC_NOINIT_ATTR static uint32_t g_stageMagic;
+RTC_NOINIT_ATTR static uint8_t  g_stage;
+static uint8_t g_crashStage = ST_NONE;      // stage before a watchdog/panic reset
+#define STAGE(s) (g_stage = (s))
 
 char     payloadBuf[1536];
+
+static void busQuiet();
+static void busResume();
 
 // History ring buffer
 struct HistSample { int16_t out, mains, ess, batv, soc, bata; };
@@ -244,7 +256,6 @@ static const char *switchStateName()
     return "off";
 }
 
-static float periodToHz(int16_t p) { return p > 0 ? 10.0f / (float)p : 0.0f; }
 
 static bool isDefaultPassword() { return strcmp(cfg.adminPass, DEFAULT_ADMIN_PASS) == 0; }
 
@@ -345,7 +356,9 @@ static void onPortalSave()
 static bool handleCommand(const char *cmd, const char *arg, const char *src)
 {
     if (!strcmp(cmd, "ess_power")) {
-        g_essPower = (int16_t)constrain(atoi(arg), -1875, 1875);
+        int16_t w = (int16_t)constrain(atoi(arg), -1875, 1875);
+        if (w != g_essPower) g_essDirty = true;
+        g_essPower = w;
         g_lastEssCmdMs = millis();
         vebus.setESSPower(g_essPower);
         Serial.printf("[%s] ESS → %d W\n", src, g_essPower);
@@ -360,6 +373,7 @@ static bool handleCommand(const char *cmd, const char *arg, const char *src)
     }
     else if (!strcmp(cmd, "virtual_mode")) {
         bool on = (strcasecmp(arg, "ON") == 0 || atoi(arg) != 0);
+        if (on != vebus.isVirtualSetpointMode()) g_essDirty = true;
         vebus.enableVirtualSetpointMode(on);
         Serial.printf("[%s] Virtual mode → %s\n", src, on ? "ON" : "OFF");
     }
@@ -377,190 +391,18 @@ static bool handleCommand(const char *cmd, const char *arg, const char *src)
 }
 
 // =======================================================================
-// UPS view of the Multiplus (used by NUT, MQTT and the dashboard)
+// UPS add-ons (NUT / apcupsd) — configuration from the settings
 // =======================================================================
-static bool mainsPresent()
+static void applyUpsConfig()
 {
-    // LED "mains on" (steady or blinking) or a measurable mains voltage
-    byte led = vebus.getLEDon() | vebus.getLEDblink();
-    return (led & VEBUS_LED_MAINS_ON) || live.mainsV > 150;
-}
-
-static bool lowBattery()
-{
-    byte led = vebus.getLEDon() | vebus.getLEDblink();
-    if (led & VEBUS_LED_LOW_BATTERY) return true;
-    return cfg.lowSoc && live.socValid && live.soc <= cfg.lowSoc;
-}
-
-// NUT-style status string, e.g. "OL CHRG", "OB DISCHRG LB"
-static void upsStatus(char *out, size_t n)
-{
-    Buf b(out, n);
-    if (vebus.hasNoSync()) { b.add("UNKNOWN"); return; }   // no data from the Multiplus
-    bool mains = mainsPresent();
-    b.add(mains ? "OL" : "OB");
-    if (mains && live.batA > 0) b.add(" CHRG");
-    if (!mains)                 b.add(" DISCHRG");
-    if (lowBattery())           b.add(" LB");
-    if ((vebus.getLEDon() | vebus.getLEDblink()) & VEBUS_LED_OVERLOAD) b.add(" OVER");
-    if (g_devState == VEBUS_STATE_OFF || g_devState == VEBUS_STATE_DOWN) b.add(" OFF");
-    if (nut.fsd)                b.add(" FSD");
-}
-
-static float runtimeMinutes();
-
-// Variables served over NUT. Returns false (-> ERR DATA-STALE) without VE.Bus sync.
-static bool nutVars(std::function<void(const char *, const char *)> emit)
-{
-    char v[32];
-    emit("device.mfr",     "Victron Energy");
-    emit("device.model",   "MultiPlus");
-    emit("device.type",    "ups");
-    emit("driver.name",    "vebus-esp32");
-    emit("driver.version", "1.2.0");
-    emit("ups.mfr",        "Victron Energy");
-    emit("ups.model",      "MultiPlus");
-    if (g_fwVersion[0]) emit("ups.firmware", g_fwVersion);
-    upsStatus(v, sizeof(v));                                      emit("ups.status", v);
-    snprintf(v, sizeof(v), "%d", live.outW);                      emit("ups.realpower", v);
-    if (cfg.nominalW) {
-        snprintf(v, sizeof(v), "%u", cfg.nominalW);               emit("ups.realpower.nominal", v);
-        snprintf(v, sizeof(v), "%ld", constrain(live.outW * 100L / cfg.nominalW, 0L, 200L));
-        emit("ups.load", v);
-    }
-    snprintf(v, sizeof(v), "%.1f", vebus.getTemp());              emit("ups.temperature", v);
-    if (live.socValid) {
-        snprintf(v, sizeof(v), "%d", (int)constrain(live.soc, 0, 100)); emit("battery.charge", v);
-    }
-    snprintf(v, sizeof(v), "%u", cfg.lowSoc);                     emit("battery.charge.low", v);
-    float rt = runtimeMinutes();
-    if (rt >= 0) { snprintf(v, sizeof(v), "%ld", lroundf(rt * 60)); emit("battery.runtime", v); }
-    snprintf(v, sizeof(v), "%.2f", vebus.getBatVolt());           emit("battery.voltage", v);
-    snprintf(v, sizeof(v), "%d", live.batA);                      emit("battery.current", v);
-    snprintf(v, sizeof(v), "%d", live.mainsV);                    emit("input.voltage", v);
-    snprintf(v, sizeof(v), "%d", live.mainsA);                    emit("input.current", v);
-    snprintf(v, sizeof(v), "%.1f", periodToHz(live.mainsPeriod)); emit("input.frequency", v);
-    snprintf(v, sizeof(v), "%d", live.mainsW);                    emit("input.realpower", v);
-    snprintf(v, sizeof(v), "%d", live.invV);                      emit("output.voltage", v);
-    snprintf(v, sizeof(v), "%d", live.invA);                      emit("output.current", v);
-    snprintf(v, sizeof(v), "%.1f", periodToHz(live.invPeriod));   emit("output.frequency", v);
-    return !vebus.hasNoSync();
-}
-
-// Remaining runtime in minutes from capacity, SoC and current load; -1 = unknown.
-static float runtimeMinutes()
-{
-    if (!cfg.batteryWh || !live.socValid || vebus.hasNoSync()) return -1;
-    float whLeft = cfg.batteryWh * constrain(live.soc, 0, 100) / 100.0f;
-    float load   = max((float)live.outW, 20.0f);        // idle consumption floor
-    return min(whLeft / load * 60.0f, 9999.0f);
-}
-
-// Current mains-failure duration in seconds (0 while on mains).
-static uint32_t secondsOnBattery()
-{
-    return g_onBatt ? (millis() - g_onBattSinceMs) / 1000 : 0;
-}
-
-static void trackMainsFailures()
-{
-    if (vebus.hasNoSync()) return;
-    bool onBatt = !mainsPresent();
-    if (onBatt && !g_onBatt) {
-        g_onBattSinceMs = millis();
-        g_numXfers++;
-        Serial.println("[ups] mains lost — on battery");
-    } else if (!onBatt && g_onBatt) {
-        g_cumOnBattS += secondsOnBattery();
-        Serial.println("[ups] mains restored");
-    }
-    g_onBatt = onBatt;
-}
-
-static void fmtApcDate(char *out, size_t n, time_t t)
-{
-    struct tm tm;
-    gmtime_r(&t, &tm);
-    strftime(out, n, "%Y-%m-%d %H:%M:%S +0000", &tm);
-}
-
-// Status lines in the order apcupsd prints them.
-static void apcFields(std::function<void(const char *, const char *)> emit)
-{
-    char v[48];
-    time_t now = time(nullptr);
-    bool   clock = now > 1600000000;
-    bool   stale = vebus.hasNoSync();
-
-    if (clock) { fmtApcDate(v, sizeof(v), now); emit("DATE", v); }
-    emit("HOSTNAME", hostName);
-    emit("VERSION",  "3.14.14 (31 May 2016) vebus-esp32");
-    emit("UPSNAME",  cfg.nutUps);
-    emit("CABLE",    "VE.Bus RS485");
-    emit("DRIVER",   "VE.Bus ESP32 Driver");
-    emit("UPSMODE",  "Stand Alone");
-    if (clock && g_bootEpoch) { fmtApcDate(v, sizeof(v), g_bootEpoch); emit("STARTTIME", v); }
-    emit("MODEL",    "Victron MultiPlus");
-
-    // STATFLAG bits as defined by apcupsd
-    const uint32_t ONLINE = 0x08, ONBATT = 0x10, OVERLOAD = 0x20, BATTLOW = 0x40,
-                   COMMLOST = 0x100, SHUTDOWN = 0x200, PLUGGED = 0x1000000,
-                   BATTPRESENT = 0x4000000;
-    uint32_t flags = PLUGGED | BATTPRESENT;
-    char status[40];
-    Buf st(status, sizeof(status));
-    if (stale) {
-        flags |= COMMLOST;
-        st.add("COMMLOST");
-    } else {
-        bool mains = mainsPresent();
-        flags |= mains ? ONLINE : ONBATT;
-        st.add(mains ? "ONLINE" : "ONBATT");
-        if (lowBattery()) { flags |= BATTLOW; st.add(" LOWBATT"); }
-        if ((vebus.getLEDon() | vebus.getLEDblink()) & VEBUS_LED_OVERLOAD) { flags |= OVERLOAD; st.add(" OVERLOAD"); }
-        if (nut.fsd) { flags |= SHUTDOWN; st.add(" SHUTTING DOWN"); }
-    }
-    emit("STATUS", status);
-
-    if (!stale) {
-        snprintf(v, sizeof(v), "%.1f Volts", (float)live.mainsV);            emit("LINEV", v);
-        if (cfg.nominalW) {
-            snprintf(v, sizeof(v), "%.1f Percent", constrain(live.outW * 100.0f / cfg.nominalW, 0.0f, 200.0f));
-            emit("LOADPCT", v);
-        }
-        if (live.socValid) {
-            snprintf(v, sizeof(v), "%.1f Percent", (float)constrain(live.soc, 0, 100)); emit("BCHARGE", v);
-        }
-        float rt = runtimeMinutes();
-        if (rt >= 0) { snprintf(v, sizeof(v), "%.1f Minutes", rt);           emit("TIMELEFT", v); }
-    }
-    snprintf(v, sizeof(v), "%u Percent", cfg.lowSoc);                        emit("MBATTCHG", v);
-    if (!stale) {
-        snprintf(v, sizeof(v), "%.1f Volts", (float)live.invV);             emit("OUTPUTV", v);
-        snprintf(v, sizeof(v), "%.1f C", vebus.getTemp());                   emit("ITEMP", v);
-        snprintf(v, sizeof(v), "%.1f Volts", vebus.getBatVolt());            emit("BATTV", v);
-        snprintf(v, sizeof(v), "%.1f Hz", periodToHz(live.mainsPeriod));     emit("LINEFREQ", v);
-    }
-    snprintf(v, sizeof(v), "%lu", (unsigned long)g_numXfers);               emit("NUMXFERS", v);
-    snprintf(v, sizeof(v), "%lu Seconds", (unsigned long)secondsOnBattery()); emit("TONBATT", v);
-    snprintf(v, sizeof(v), "%lu Seconds", (unsigned long)(g_cumOnBattS + secondsOnBattery()));
-    emit("CUMONBATT", v);
-    snprintf(v, sizeof(v), "0x%08lX", (unsigned long)flags);                emit("STATFLAG", v);
-    uint8_t mac[6];
-    WiFi.macAddress(mac);
-    snprintf(v, sizeof(v), "VEBUS%02X%02X%02X%02X%02X%02X",
-             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);               emit("SERIALNO", v);
-    if (cfg.nominalW) { snprintf(v, sizeof(v), "%u Watts", cfg.nominalW);  emit("NOMPOWER", v); }
-    if (g_fwVersion[0]) emit("FIRMWARE", g_fwVersion);
-    if (clock) { fmtApcDate(v, sizeof(v), now); emit("END APC", v); }
-}
-
-static void applyNutConfig()
-{
-    nut.upsName = cfg.nutUps;
-    nut.user    = cfg.nutUser;
-    nut.pass    = cfg.nutPass;
+    ups.lowSocPct = cfg.lowSoc;
+    ups.nominalW  = cfg.nominalW;
+    ups.batteryWh = cfg.batteryWh;
+    nut.upsName   = cfg.nutUps;
+    nut.user      = cfg.nutUser;
+    nut.pass      = cfg.nutPass;
+    apc.upsName   = cfg.nutUps;
+    apc.hostName  = hostName;
     if (!cfg.nutEnabled) nut.end();   // started from loop() once WiFi is up
     if (!cfg.apcEnabled) apc.end();
 }
@@ -575,11 +417,12 @@ static void buildStateJson(Buf &j)
     j.add("\"charger_status\":%u,\"ess_power\":%d,\"ess_power_eff\":%d,\"virtual_mode\":\"%s\",",
           (unsigned)vebus.getChargerStatus(), (int)g_essPower,
           (int)vebus.getEffectiveESSPower(), vebus.isVirtualSetpointMode() ? "ON" : "OFF");
-    j.add("\"mains_voltage\":%d,\"mains_current\":%d,\"inv_voltage\":%d,\"inv_current\":%d,"
-          "\"output_power\":%d,\"mains_power\":%d,",
+    j.add("\"mains_voltage\":%.1f,\"mains_current\":%.2f,\"inv_voltage\":%.1f,\"inv_current\":%.2f,"
+          "\"output_power\":%.0f,\"mains_power\":%.0f,",
           live.mainsV, live.mainsA, live.invV, live.invA, live.outW, live.mainsW);
-    j.add("\"bat_current\":%d,\"soc\":%d,\"mains_freq\":%.1f,\"inv_freq\":%.1f,",
-          live.batA, live.soc, periodToHz(live.mainsPeriod), periodToHz(live.invPeriod));
+    j.add("\"bat_current\":%.1f,\"soc\":%.1f,", live.batA, live.soc);
+    if (live.mainsHz > 0) j.add("\"mains_freq\":%.2f,", live.mainsHz); else j.add("\"mains_freq\":null,");
+    if (live.invHz > 0)   j.add("\"inv_freq\":%.2f,", live.invHz);     else j.add("\"inv_freq\":null,");
     j.add("\"led_on\":%u,\"led_blink\":%u,\"ac_in_min\":%.1f,\"ac_in_max\":%.1f,"
           "\"ac_in_actual\":%.1f,\"ac_in_config\":%u,",
           (unsigned)vebus.getLEDon(), (unsigned)vebus.getLEDblink(),
@@ -592,9 +435,9 @@ static void buildStateJson(Buf &j)
     j.add("\"sync\":\"%s\",\"dc_allows_inv\":\"%s\",\"switch_state\":\"%s\",",
           vebus.hasNoSync() ? "OFF" : "ON",
           vebus.dcLevelAllowsInverting() ? "ON" : "OFF", switchStateName());
-    char ups[32];
-    upsStatus(ups, sizeof(ups));
-    j.add("\"ups_status\":\"%s\",\"nut_clients\":%u,\"apc_clients\":%u,", ups,
+    char upsSt[32];
+    ups.nutStatus(upsSt, sizeof(upsSt));
+    j.add("\"ups_status\":\"%s\",\"nut_clients\":%u,\"apc_clients\":%u,", upsSt,
           (unsigned)nut.clientCount(), (unsigned)apc.clientCount());
     j.add("\"firmware_version\":\"%s\",\"rssi\":%d,\"uptime\":%lu,\"free_heap\":%u}",
           g_fwVersion, (int)WiFi.RSSI(), (unsigned long)(millis() / 1000),
@@ -652,9 +495,9 @@ static const Entity ENTITIES[] = {
     // LED, limits, status
     {"sensor", "vebus_led_on",       false, "LED On",            "led_on",           nullptr, ""},
     {"sensor", "vebus_led_blink",    false, "LED Blink",         "led_blink",        nullptr, ""},
-    {"sensor", "vebus_ac_in_min",    false, "AC Input Min",      "ac_in_min",        nullptr, "\"unit_of_meas\":\"A\",\"dev_cla\":\"current\""},
-    {"sensor", "vebus_ac_in_max",    false, "AC Input Max",      "ac_in_max",        nullptr, "\"unit_of_meas\":\"A\",\"dev_cla\":\"current\""},
-    {"sensor", "vebus_ac_in_actual", false, "AC Input Actual",   "ac_in_actual",     nullptr, "\"unit_of_meas\":\"A\",\"dev_cla\":\"current\""},
+    {"sensor", "vebus_ac_in_min",    false, "AC Input Min",      "ac_in_min",        nullptr, "\"unit_of_meas\":\"A\",\"dev_cla\":\"current\"" MEAS},
+    {"sensor", "vebus_ac_in_max",    false, "AC Input Max",      "ac_in_max",        nullptr, "\"unit_of_meas\":\"A\",\"dev_cla\":\"current\"" MEAS},
+    {"sensor", "vebus_ac_in_actual", false, "AC Input Actual",   "ac_in_actual",     nullptr, "\"unit_of_meas\":\"A\",\"dev_cla\":\"current\"" MEAS},
     {"sensor", "vebus_ac_in_cfg",    false, "AC Input Config",   "ac_in_config",     nullptr, ""},
     {"sensor", "vebus_dev_state",    false, "Device State",      "device_state",     nullptr, ""},
     {"sensor", "vebus_charge_sub",   false, "Charge Sub-State",  "charge_sub_state", nullptr, ""},
@@ -759,7 +602,6 @@ static void connectMqtt()
 
         g_discIdx = 0;          // discovery is sent incrementally from loop()
         g_publishNow = true;
-        vebus.requestVersion();
         vebus.requestDeviceState();
     } else {
         Serial.printf(" failed (rc=%d)\n", mqtt.state());
@@ -772,8 +614,9 @@ static void connectMqtt()
 static void histAccumulate()
 {
     if (vebus.hasNoSync()) return;   // no data → leave a gap
-    int32_t v[6] = { live.outW, live.mainsW, vebus.getEffectiveESSPower(),
-                     (int32_t)lroundf(vebus.getBatVolt() * 100.0f), live.soc, live.batA };
+    int32_t v[6] = { lroundf(live.outW), lroundf(live.mainsW), vebus.getEffectiveESSPower(),
+                     lroundf(vebus.getBatVolt() * 100.0f), lroundf(live.soc * 10.0f),
+                     lroundf(live.batA * 10.0f) };
     for (int i = 0; i < 6; i++) histAcc[i] += v[i];
     histAccN++;
 }
@@ -814,11 +657,12 @@ static void handleState()
     buildStateJson(j);
     j.len--;                          // reopen the object
     j.add(",\"mqtt\":%s,\"mqtt_reconnects\":%lu,\"wifi_reconnects\":%lu,\"ip\":\"%s\","
-          "\"host\":\"%s\",\"reset_reason\":\"%s\",\"default_pw\":%s,\"ess_timeout\":%u,"
+          "\"host\":\"%s\",\"reset_reason\":\"%s\",\"crash_stage\":\"%s\",\"default_pw\":%s,\"ess_timeout\":%u,"
           "\"device_id\":",
           mqtt.connected() ? "true" : "false", (unsigned long)g_mqttReconnects,
           (unsigned long)g_wifiReconnects, WiFi.localIP().toString().c_str(), hostName,
-          resetReasonName(), isDefaultPassword() ? "true" : "false", cfg.essTimeoutS);
+          resetReasonName(), STAGE_NAMES[g_crashStage], isDefaultPassword() ? "true" : "false",
+          cfg.essTimeoutS);
     j.str(cfg.deviceId);
     j.add("}");
     sendJson(payloadBuf);
@@ -915,7 +759,7 @@ static void handlePostConfig()
     saveConfig();
     makeHostName();
     applyMqttConfig();
-    applyNutConfig();
+    applyUpsConfig();
     Serial.println("[web] config saved — reconnecting MQTT");
     sendJson("{\"ok\":true}");
 }
@@ -928,6 +772,29 @@ static void handleControl()
         sendJson("{\"ok\":true}");
     else
         sendJson("{\"ok\":false,\"error\":\"unknown command\"}", 400);
+}
+
+// Diagnostics: recent VE.Bus responses + scaler state
+static void handleDebug()
+{
+    if (!checkAuth()) return;
+    Buf j(payloadBuf, sizeof(payloadBuf));
+    j.add("{\"responses\":[");
+    for (uint8_t i = 0; i < VEBus::VEBUS_RESP_LOG; i++) {
+        uint8_t b[12];
+        uint8_t n = vebus.getResponseLog(i, b, sizeof(b));
+        j.add(i ? ",\"" : "\"");
+        for (uint8_t k = 0; k < n; k++) j.add("%02X", b[k]);
+        j.add("\"");
+    }
+    j.add("],\"scale\":{");
+    for (uint8_t id = 0; id < VEBusScaler::MAX_ID; id++) {
+        const VEBusVarInfo &vi = scaler.info(id);
+        j.add("%s\"%u\":[%g,%d,%d,%d]", id ? "," : "", id, vi.scale, vi.offset,
+              vi.isSigned, scaler.fromDevice(id));
+    }
+    j.add("},\"scaler_done\":%s}", scaler.complete() ? "true" : "false");
+    sendJson(payloadBuf);
 }
 
 static void handleReboot()
@@ -960,9 +827,11 @@ static void handleUpdateUpload()
 {
     HTTPUpload &up = server.upload();
     esp_task_wdt_reset();                       // large uploads take a while
+    STAGE(ST_OTA);
     if (up.status == UPLOAD_FILE_START) {
         g_otaAuthed = server.authenticate(ADMIN_USER, cfg.adminPass);
         if (!g_otaAuthed) return;
+        busQuiet();                             // flash writes stall both cores
         Serial.printf("[ota] start: %s\n", up.filename.c_str());
         if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
     } else if (!g_otaAuthed) {
@@ -971,9 +840,10 @@ static void handleUpdateUpload()
         if (Update.write(up.buf, up.currentSize) != up.currentSize) Update.printError(Serial);
     } else if (up.status == UPLOAD_FILE_END) {
         if (Update.end(true)) Serial.printf("[ota] done: %u bytes\n", up.totalSize);
-        else                  Update.printError(Serial);
+        else                { Update.printError(Serial); busResume(); }
     } else if (up.status == UPLOAD_FILE_ABORTED) {
         Update.abort();
+        busResume();
         Serial.println("[ota] aborted");
     }
 }
@@ -999,10 +869,29 @@ static void setupWebServer()
     server.on("/admin/api/config", HTTP_POST, handlePostConfig);
     server.on("/admin/api/control",HTTP_POST, handleControl);
     server.on("/admin/api/reboot", HTTP_POST, handleReboot);
+    server.on("/admin/api/debug",  HTTP_GET,  handleDebug);
     server.on("/admin/api/wifireset", HTTP_POST, handleWifiReset);
     server.on("/admin/update",     HTTP_POST, handleUpdateDone, handleUpdateUpload);
     server.onNotFound([] { server.send(404, "text/plain", "Not found"); });
     server.begin();
+}
+
+// =======================================================================
+// Bus silence: stop transmitting and switch the transceiver off before a
+// restart or while flash is written (OTA), so nothing can reach the VE.Bus
+// out of its time slot.
+// =======================================================================
+static void busQuiet()
+{
+    vebus.setTxEnabled(false);
+    delay(20);                                  // a frame on the wire is < 1 ms
+    digitalWrite(VEBUS_PIN_SHDN, LOW);
+}
+
+static void busResume()
+{
+    digitalWrite(VEBUS_PIN_SHDN, HIGH);
+    vebus.setTxEnabled(true);
 }
 
 // =======================================================================
@@ -1033,6 +922,14 @@ static void superviseWiFi(uint32_t now)
         if (down) {
             Serial.printf("[wifi] reconnected (%s)\n", WiFi.localIP().toString().c_str());
             g_wifiReconnects++;
+            // Listening sockets do not reliably survive a reconnect on the
+            // ESP32 core — restart every server so they stay reachable.
+            server.stop();
+            server.begin();
+            nut.end();                          // re-begun from loop()
+            apc.end();
+            MDNS.end();
+            if (MDNS.begin(hostName)) MDNS.addService("http", "tcp", 80);
         }
         down = false;
         return;
@@ -1085,16 +982,38 @@ void setup()
     delay(200);
     Serial.println("\n=== VEBus MQTT → Home Assistant ===");
     Serial.printf("Reset reason: %s\n", resetReasonName());
+    esp_reset_reason_t rr = esp_reset_reason();
+    if (g_stageMagic == 0x5EB0CAFE && g_stage < sizeof(STAGE_NAMES) / sizeof(STAGE_NAMES[0]) &&
+        (rr == ESP_RST_TASK_WDT || rr == ESP_RST_INT_WDT || rr == ESP_RST_WDT || rr == ESP_RST_PANIC))
+    {
+        g_crashStage = g_stage;
+        Serial.printf("Last reset happened in: %s\n", STAGE_NAMES[g_crashStage]);
+    }
+    g_stageMagic = 0x5EB0CAFE;
+    g_stage = ST_NONE;
 
-    // Enable RS485 transceiver
+    // RS485 transceiver stays off until the UART drives TX to its idle level
     pinMode(VEBUS_PIN_SHDN, OUTPUT);
-    digitalWrite(VEBUS_PIN_SHDN, HIGH);
+    digitalWrite(VEBUS_PIN_SHDN, LOW);
 
-    // Start VEBus (internal task on core 0)
+    // Start VEBus (configures UART, RS485 task on core 1), then enable the bus
     vebus.begin(VEBUS_PIN_RX, VEBUS_PIN_TX, VEBUS_PIN_RE);
+    digitalWrite(VEBUS_PIN_SHDN, HIGH);
+    esp_register_shutdown_handler(busQuiet);   // every orderly restart goes quiet first
     Serial.println("VE.Bus started.");
 
     loadConfig();
+
+    // Restore the last ESS setpoint and battery-neutral mode (survive reboots/updates)
+    prefs.begin("vebus_mqtt", true);
+    g_essPower = prefs.getShort("essw", 0);
+    bool vmode = prefs.getBool("vmode", false);
+    prefs.end();
+    g_lastEssCmdMs = millis();                  // fail-safe timeout counts from boot
+    vebus.setESSPower(g_essPower);
+    if (vmode) vebus.enableVirtualSetpointMode(true);
+    Serial.printf("[cfg] ESS setpoint %d W, battery-neutral %s (restored)\n",
+                  g_essPower, vmode ? "ON" : "OFF");
     makeHostName();
     Serial.printf("[cfg] MQTT=%s:%u user='%s' device='%s' prefix='%s'\n",
                   cfg.mqttHost, cfg.mqttPort, cfg.mqttUser, cfg.deviceId, cfg.prefix);
@@ -1150,9 +1069,7 @@ void setup()
 
     // NUT server (started from loop() once WiFi is up)
     nut.upsDesc = "Victron MultiPlus (VE.Bus)";
-    nut.vars    = nutVars;
-    apc.fields  = apcFields;
-    applyNutConfig();
+    applyUpsConfig();
     if (cfg.nutEnabled)
         Serial.printf("[nut] UPS '%s' on port 3493%s\n", cfg.nutUps,
                       cfg.nutUser[0] ? " (auth required)" : "");
@@ -1176,21 +1093,23 @@ void loop()
     esp_task_wdt_reset();
     uint32_t now = millis();
 
+    STAGE(ST_WIFI);
     superviseWiFi(now);
+    STAGE(ST_WEB);
     server.handleClient();
 
+    STAGE(ST_MQTT);
     connectMqtt();
     mqtt.loop();
 
+    STAGE(ST_UPS);
     if (cfg.nutEnabled && WiFi.status() == WL_CONNECTED) nut.begin();   // no-op once running
     nut.loop();
     if (cfg.apcEnabled && WiFi.status() == WL_CONNECTED) apc.begin();
     apc.loop();
-    trackMainsFailures();
-    if (!g_bootEpoch && time(nullptr) > 1600000000)
-        g_bootEpoch = time(nullptr) - millis() / 1000;
-    if (nut.fsd && mainsPresent() && !lowBattery()) nut.fsd = false;    // power is back
+    ups.loop();                       // mains-failure statistics, clears FSD
 
+    STAGE(ST_DISCOVERY);
     // Discovery, one entity per pass; a failed publish is retried (max 3x)
     if (g_discIdx < ENTITY_COUNT && mqtt.connected())
     {
@@ -1260,37 +1179,50 @@ void loop()
         stateRequested = true;
     }
 
+    STAGE(ST_VEBUS);
+    scaler.loop();          // queries scale/offset of each RAM variable once
+
     // Extended RAM responses — matched by RAM id, so a late or dropped
-    // response can never land in the wrong variable.
+    // response can never land in the wrong variable; converted to real units.
     if (vebus.hasRAMVarResponse())
     {
         for (uint8_t i = 0; i < vebus.getRAMVarCount(); i++)
         {
-            int16_t v = vebus.getRAMVarValue(i);
-            switch (vebus.getRAMVarId(i))
-            {
-            case VEBUS_RAM_UMAINS_RMS:      live.mainsV = v; break;
-            case VEBUS_RAM_IMAINS_RMS:      live.mainsA = v; break;
-            case VEBUS_RAM_UINVERTER_RMS:   live.invV   = v; break;
-            case VEBUS_RAM_IINVERTER_RMS:   live.invA   = v; break;
-            case VEBUS_RAM_OUTPUT_POWER:    live.outW   = v;
-                                            vebus.setACOutLoad(v);   // virtual setpoint mode
-                                            break;
-            case VEBUS_RAM_MAINS_POWER:     live.mainsW = v; break;
-            case VEBUS_RAM_IBAT:            live.batA   = v; break;
-            case VEBUS_RAM_CHARGE_STATE:    live.soc    = v; live.socValid = true; break;
-            case VEBUS_RAM_MAINS_PERIOD:    live.mainsPeriod = v; break;
-            case VEBUS_RAM_INVERTER_PERIOD: live.invPeriod   = v; break;
-            default: break;
-            }
+            uint8_t id  = vebus.getRAMVarId(i);
+            int16_t raw = vebus.getRAMVarValue(i);
+            bool period = id == VEBUS_RAM_MAINS_PERIOD || id == VEBUS_RAM_INVERTER_PERIOD;
+            float v = period ? scaler.frequency(id, raw) : scaler.value(id, raw);
+            ups.set(id, v);
+            if (id == VEBUS_RAM_OUTPUT_POWER)
+                vebus.setACOutLoad((int16_t)lroundf(v));   // virtual setpoint mode
         }
         vebus.clearRAMVarResponse();
+    }
+
+    // Firmware version: asked once after VE.Bus is in sync (it never changes)
+    static bool versionRequested = false;
+    if (!versionRequested && !vebus.hasNoSync())
+    {
+        versionRequested = true;
+        vebus.requestVersion();
+    }
+
+    // Persist ESS setpoint / battery-neutral mode (at most once a minute)
+    if (g_essDirty && (!g_essSavedMs || now - g_essSavedMs >= 60000))
+    {
+        prefs.begin("vebus_mqtt", false);
+        prefs.putShort("essw", g_essPower);
+        prefs.putBool("vmode", vebus.isVirtualSetpointMode());
+        prefs.end();
+        g_essDirty   = false;
+        g_essSavedMs = now;
     }
 
     if (vebus.hasDeviceStateResponse())
     {
         g_devState    = vebus.getDeviceState();
         g_devSubState = vebus.getDeviceSubState();
+        ups.data.deviceState = g_devState;
         vebus.clearDeviceStateResponse();
     }
 
@@ -1298,11 +1230,12 @@ void loop()
     {
         snprintf(g_fwVersion, sizeof(g_fwVersion), "%u.%u",
                  vebus.getVersionHigh(), vebus.getVersionLow());
+        strlcpy(ups.data.firmware, g_fwVersion, sizeof(ups.data.firmware));
         vebus.clearVersionResponse();
     }
 
-    // Auto-wakeup on no-sync
-    if (vebus.hasNoSync())
+    // Auto-wakeup on no-sync (not while the bus is deliberately muted)
+    if (vebus.hasNoSync() && vebus.isTxEnabled())
     {
         static uint32_t lastWakeupMs = 0;
         if (now - lastWakeupMs >= WAKEUP_RETRY_MS)
@@ -1313,6 +1246,7 @@ void loop()
         }
     }
 
+    STAGE(ST_PUBLISH);
     // Publish state periodically (or right after a command)
     if (now - lastPublishMs >= PUBLISH_INTERVAL_MS || g_publishNow)
     {
@@ -1323,13 +1257,16 @@ void loop()
         if (mqtt.connected()) publishState();
     }
 
+    STAGE(ST_HISTORY);
     if (now - histLastMs >= HIST_INTERVAL_MS)
     {
         histLastMs += HIST_INTERVAL_MS;
         histPush();
     }
 
+    STAGE(ST_SERIAL);
     pollSerial();
+    STAGE(ST_NONE);
 
     if (g_restartAtMs && (int32_t)(now - g_restartAtMs) >= 0)
     {

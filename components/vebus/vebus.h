@@ -57,7 +57,7 @@ class VEBusHub : public PollingComponent {
   VEBus *driver() { return &vebus_; }
 
  protected:
-  int rx_pin_{-1}, tx_pin_{-1}, de_pin_{-1}, core_{0};
+  int rx_pin_{-1}, tx_pin_{-1}, de_pin_{-1}, core_{1};
   int16_t initial_ess_power_{0};
   bool    virtual_mode_initial_{false};
   int16_t virtual_mode_deadband_{10};

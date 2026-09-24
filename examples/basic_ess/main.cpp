@@ -136,14 +136,17 @@ void setup()
     Serial.println("\n=== VEBus Basic ESS example ===");
     Serial.printf("Library compiled %s %s\n", __DATE__, __TIME__);
 
-    // Enable the RS485 transceiver (MAX13487E /SHDN must be HIGH!)
+    // Keep the RS485 transceiver off until the UART drives TX to idle
     pinMode(VEBUS_PIN_SHDN, OUTPUT);
-    digitalWrite(VEBUS_PIN_SHDN, HIGH);
+    digitalWrite(VEBUS_PIN_SHDN, LOW);
 
-    // Start the library — launches an internal tight-loop task on core 0.
+    // Start the library — configures the UART, launches the RS485 task (core 1)
     vebus.begin(VEBUS_PIN_RX, VEBUS_PIN_TX, VEBUS_PIN_RE);
 
-    Serial.println("VE.Bus driver started (task on core 0).");
+    // Now enable the transceiver (MAX13487E /SHDN must be HIGH)
+    digitalWrite(VEBUS_PIN_SHDN, HIGH);
+
+    Serial.println("VE.Bus driver started (task on core 1).");
     Serial.printf("Arduino loop() running on core %d.\n\n", xPortGetCoreID());
     printHelp();
 }

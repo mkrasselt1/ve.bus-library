@@ -1,29 +1,39 @@
 #pragma once
-// Minimal NUT (Network UPS Tools) server — speaks enough of the upsd network
-// protocol (port 3493) for upsmon, Synology/QNAP/TrueNAS, Proxmox, WinNUT and
-// the Home Assistant NUT integration to monitor the Multiplus as a UPS and
-// shut down on low battery.
+// VEBusNutServer — NUT (Network UPS Tools) server for a Multiplus (optional,
+// header-only; only compiled into your firmware when you #include it).
+//
+// Speaks enough of the upsd network protocol (TCP 3493) for upsmon,
+// Synology/QNAP/TrueNAS, Proxmox, WinNUT and the Home Assistant NUT
+// integration to monitor the Multiplus as a UPS and shut down on low battery.
 //
 // Read-only: no SET/INSTCMD. Authentication (USERNAME/PASSWORD) is enforced
 // for LOGIN / PRIMARY / FSD when credentials are configured.
+//
+//   VEBusUps       ups(vebus);
+//   VEBusNutServer nut(ups);
+//   setup(): nut.begin();          // after WiFi is up
+//   loop():  ups.loop(); nut.loop();
 #include <Arduino.h>
 #include <WiFi.h>
 #include <functional>
+#include "VEBusUps.h"
 
-class NutServer {
+class VEBusNutServer {
 public:
     static const uint8_t MAX_CLIENTS = 4;
     static const uint32_t IDLE_TIMEOUT_MS = 300000;   // drop silent clients after 5 min
 
-    // Emits one "name value" pair per call; return false for stale data.
-    using VarFn = std::function<bool(std::function<void(const char *, const char *)>)>;
+    using EmitFn = std::function<void(const char *, const char *)>;
+
+    explicit VEBusNutServer(VEBusUps &ups) : _ups(ups) {}
 
     const char *upsName  = "multiplus";
     const char *upsDesc  = "Victron MultiPlus (VE.Bus)";
     const char *user     = "";      // empty = accept any credentials
     const char *pass     = "";
-    VarFn       vars;
-    bool        fsd      = false;   // forced shutdown flag set by a primary
+    const char *driverVersion = "1.3.0";
+    // Optional: add your own variables (called after the built-in ones).
+    std::function<void(EmitFn)> extraVars;
 
     void begin(uint16_t port = 3493)
     {
@@ -105,6 +115,7 @@ private:
         char       userBuf[32] = "";
     };
 
+    VEBusUps  &_ups;
     WiFiServer _server{3493};
     Client     _c[MAX_CLIENTS];
     bool       _running = false;
@@ -217,7 +228,7 @@ private:
         else if (!strcasecmp(cmd, "FSD")) {
             if (n < 2 || !_knownUps(t[1])) _send(c, "ERR UNKNOWN-UPS\n");
             else if (!_credsOk(c) || (user[0] && !c.hasPass)) _send(c, "ERR ACCESS-DENIED\n");
-            else { fsd = true; _send(c, "OK FSD-SET\n"); }
+            else { _ups.fsd = true; _send(c, "OK FSD-SET\n"); }
         }
         else if (!strcasecmp(cmd, "LOGOUT")) {
             _send(c, "OK Goodbye\n");
@@ -256,9 +267,10 @@ private:
             const char *want = t[3];
             String val;
             bool found = false;
-            bool fresh = vars([&](const char *k, const char *v) {
+            _vars([&](const char *k, const char *v) {
                 if (!found && !strcmp(k, want)) { val = v; found = true; }
             });
+            bool fresh = !_ups.stale();
             if (!found)       { _send(c, "ERR VAR-NOT-SUPPORTED\n"); return; }
             if (!strcasecmp(what, "TYPE")) {
                 bool num = val.length() && strspn(val.c_str(), "-0123456789.") == val.length();
@@ -302,7 +314,7 @@ private:
             // reads UNKNOWN) so clients such as the Home Assistant NUT
             // integration can be set up before the inverter is connected.
             // GET VAR — what upsmon/NAS clients poll — still reports DATA-STALE.
-            vars([&](const char *k, const char *v) {
+            _vars([&](const char *k, const char *v) {
                 _out += "VAR "; _out += upsName; _out += ' '; _out += k; _out += ' ';
                 _quote(_out, v); _out += '\n';
             });
@@ -331,5 +343,43 @@ private:
         else {
             _send(c, "ERR INVALID-ARGUMENT\n");
         }
+    }
+    // Standard NUT variables derived from VEBusUps.
+    void _vars(EmitFn emit)
+    {
+        const VEBusUpsData &d = _ups.data;
+        VEBus &bus = _ups.bus();
+        char v[32];
+        emit("device.mfr",     "Victron Energy");
+        emit("device.model",   "MultiPlus");
+        emit("device.type",    "ups");
+        emit("driver.name",    "vebus-esp32");
+        emit("driver.version", driverVersion);
+        emit("ups.mfr",        "Victron Energy");
+        emit("ups.model",      "MultiPlus");
+        if (d.firmware[0]) emit("ups.firmware", d.firmware);
+        _ups.nutStatus(v, sizeof(v));                              emit("ups.status", v);
+        snprintf(v, sizeof(v), "%.0f", d.outW);                    emit("ups.realpower", v);
+        if (_ups.nominalW) {
+            snprintf(v, sizeof(v), "%u", _ups.nominalW);           emit("ups.realpower.nominal", v);
+            snprintf(v, sizeof(v), "%.0f", _ups.loadPct());        emit("ups.load", v);
+        }
+        snprintf(v, sizeof(v), "%.1f", bus.getTemp());             emit("ups.temperature", v);
+        if (d.socValid) {
+            snprintf(v, sizeof(v), "%.0f", _ups.socPct());         emit("battery.charge", v);
+        }
+        snprintf(v, sizeof(v), "%u", _ups.lowSocPct);              emit("battery.charge.low", v);
+        float rt = _ups.runtimeMinutes();
+        if (rt >= 0) { snprintf(v, sizeof(v), "%ld", lroundf(rt * 60)); emit("battery.runtime", v); }
+        snprintf(v, sizeof(v), "%.2f", bus.getBatVolt());          emit("battery.voltage", v);
+        snprintf(v, sizeof(v), "%.1f", d.batA);                    emit("battery.current", v);
+        snprintf(v, sizeof(v), "%.1f", d.mainsV);                  emit("input.voltage", v);
+        snprintf(v, sizeof(v), "%.2f", d.mainsA);                  emit("input.current", v);
+        snprintf(v, sizeof(v), "%.1f", _ups.mainsHz());            emit("input.frequency", v);
+        snprintf(v, sizeof(v), "%.0f", d.mainsW);                  emit("input.realpower", v);
+        snprintf(v, sizeof(v), "%.1f", d.invV);                    emit("output.voltage", v);
+        snprintf(v, sizeof(v), "%.2f", d.invA);                    emit("output.current", v);
+        snprintf(v, sizeof(v), "%.1f", _ups.outputHz());           emit("output.frequency", v);
+        if (extraVars) extraVars(emit);
     }
 };

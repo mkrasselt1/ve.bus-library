@@ -196,6 +196,41 @@ enum VEBusCmdType : uint8_t {
 // Maximum number of RAM variables per read request
 #define VEBUS_MAX_RAM_IDS 6
 
+// ===================================================================
+// RAM variable scaling (from requestRAMVarInfo)
+//
+// The Multiplus reports raw integers; each RAM variable has its own scale
+// and offset: value = scale * (raw + offset). Query them once with
+// requestRAMVarInfo(id) and convert with VEBusVarInfo::fromDevice().
+// ===================================================================
+struct VEBusVarInfo {
+    float   scale    = 1.0f;
+    int16_t offset   = 0;
+    bool    isSigned = true;
+
+    VEBusVarInfo() {}
+    VEBusVarInfo(float sc, bool sgn, int16_t ofs = 0) : scale(sc), offset(ofs), isSigned(sgn) {}
+
+    // Decode the scale word as documented by Victron: bit 15 = signed,
+    // values >= 0x4000 encode 1 / (0x8000 - value).
+    static VEBusVarInfo fromDevice(int16_t scaleWord, int16_t offset)
+    {
+        VEBusVarInfo i;
+        uint32_t sc = (uint16_t)scaleWord;
+        i.isSigned = sc >= 0x8000;
+        if (i.isSigned) sc = 0x10000 - sc;
+        i.scale  = sc >= 0x4000 ? 1.0f / (float)(0x8000 - sc) : (float)sc;
+        i.offset = offset;
+        return i;
+    }
+
+    float apply(int16_t raw) const
+    {
+        int32_t r = isSigned ? (int32_t)raw : (int32_t)(uint16_t)raw;
+        return scale * (float)(r + offset);
+    }
+};
+
 struct VEBusCmd {
     VEBusCmdType type;
     union {
@@ -240,7 +275,16 @@ public:
     VEBus();
 
     // Start the RS485 driver and launch the internal task.
-    void begin(int rxPin, int txPin, int dePin, int core = 0);
+    // Configures the UART (TX pin driven to its idle level) and starts the
+    // RS485 task. Enable the transceiver only AFTER this returns, so a
+    // floating TX pin can never put garbage on the VE.Bus.
+    // Core 1 keeps the task away from the WiFi/TCP stack on core 0.
+    void begin(int rxPin, int txPin, int dePin, int core = 1);
+
+    // Stop / resume transmitting (receiving continues). Mute before an OTA
+    // update or restart so a stalled task can never send out of its slot.
+    void setTxEnabled(bool enable);
+    bool isTxEnabled() const { return _txEnabled; }
 
     // ================================================================
     // Thread-safe commands — queued for the next sync slot.
@@ -307,6 +351,12 @@ public:
     // --- Setting/RAM variable info (scale, offset, default, min, max) ---
     void requestSettingInfo(uint8_t id);
     void requestRAMVarInfo(uint8_t id);
+
+
+    // Diagnostics: the last VEBUS_RESP_LOG frame-type-0 responses from the
+    // device (bytes from the response code on, checksum excluded), oldest first.
+    static const uint8_t VEBUS_RESP_LOG = 8;
+    uint8_t getResponseLog(uint8_t index, uint8_t *out, uint8_t maxLen) const;
 
     // ================================================================
     // Decoded data — safe to read from any core (atomic on Xtensa)
@@ -388,7 +438,7 @@ private:
     void        _run();
     void        _processRx();
     void        _sendCommand(const VEBusCmd &cmd);
-    void        _queueESSPower(int16_t effective, bool resetQueue);
+    void        _queueESSPower(int16_t effective);
 
     // Frame preparation helpers
     int  _prepareESSCommand  (char *out, int16_t power, byte frameNr);
@@ -434,6 +484,8 @@ private:
     volatile bool          _gotMP2data;
     volatile bool          _acked;
     volatile unsigned long _synctime;
+    volatile uint32_t      _syncUs;        // micros() when the sync frame arrived
+    volatile bool          _txEnabled;
     volatile uint32_t      _chksmfault;
 
     // Decoded device data — frame 0x80 (broadcast)
@@ -461,6 +513,11 @@ private:
     volatile int16_t _virtualSetpoint;
     volatile int16_t _lastACOutLoad;
     volatile int16_t _lastSentEffective;
+    uint8_t          _respLog[8][12];
+    uint8_t          _respLogLen[8];
+    volatile uint8_t _respLogHead;
+    volatile bool    _essPending;          // latest ESS setpoint waiting for TX
+    volatile int16_t _essPendingPower;
     volatile int16_t _deadband;
 
     // Flexible RAM read response (readRAMVars)

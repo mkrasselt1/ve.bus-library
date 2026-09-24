@@ -86,14 +86,14 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!doctype html>
 <div class="seg" id="range"><button data-n="60">1 h</button><button data-n="360">6 h</button><button data-n="1440" class="on">24 h</button></div></div>
 <div class="chart"><h3>Power (W)</h3><div class="legend" id="lgPower"></div><canvas id="cPower"></canvas><div class="tip"></div></div>
 <div class="chart"><h3>Battery voltage (V)</h3><canvas id="cBatV"></canvas><div class="tip"></div></div>
-<div class="chart"><h3>State of charge</h3><canvas id="cSoc"></canvas><div class="tip"></div></div>
+<div class="chart"><h3>State of charge (%)</h3><canvas id="cSoc"></canvas><div class="tip"></div></div>
 <div class="note" id="histNote"></div></section>
 <section class="card"><h2>All values</h2><div class="cols" id="details"></div></section>
 <footer id="foot"></footer></main>
 <script>
 const $=id=>document.getElementById(id);
 const TILES=[['output_power','Output power','W',0],['mains_power','Mains power','W',0],['bat_volt','Battery voltage','V',2],
-['bat_current','Battery current','A',0],['soc','State of charge','%',0],['ess_power','ESS setpoint','W',0],
+['bat_current','Battery current','A',1],['soc','State of charge','%',0],['ess_power','ESS setpoint','W',0],
 ['device_state','Device state','',null],['temp','Temperature','°C',1]];
 const DETAILS=[['AC','ac_power','AC power','W'],['AC','mains_voltage','Mains voltage','V'],['AC','mains_current','Mains current','A'],
 ['AC','mains_freq','Mains frequency','Hz'],['AC','inv_voltage','Inverter voltage','V'],['AC','inv_current','Inverter current','A'],
@@ -104,7 +104,7 @@ const DETAILS=[['AC','ac_power','AC power','W'],['AC','mains_voltage','Mains vol
 ['ESS','switch_state','Switch state',''],['Status','led_on','LED on',''],['Status','led_blink','LED blink',''],
 ['Status','ups_status','UPS status (NUT)',''],['Status','nut_clients','NUT clients',''],['Status','apc_clients','apcupsd clients',''],['Status','checksum_faults','Checksum faults',''],['Status','firmware_version','VE.Bus firmware','']];
 const SERIES={cPower:[{i:0,n:'Output',c:'--s1'},{i:1,n:'Mains',c:'--s2'},{i:2,n:'ESS effective',c:'--s3'}],
-cBatV:[{i:3,n:'Battery',c:'--s1',k:.01,d:2}],cSoc:[{i:4,n:'SoC',c:'--s1'}]};
+cBatV:[{i:3,n:'Battery',c:'--s1',k:.01,d:2}],cSoc:[{i:4,n:'SoC',c:'--s1',k:.1,d:1}]};
 let hist=null,range=1440,failCount=0;
 $('tiles').innerHTML=TILES.map(t=>`<div class="tile"><div class="l">${t[1]}</div><div class="v" id="t_${t[0]}">–</div><div class="h" id="h_${t[0]}"></div></div>`).join('');
 $('lgPower').innerHTML=SERIES.cPower.map(s=>`<span><i style="background:var(${s.c})"></i>${s.n}</span>`).join('');
@@ -122,7 +122,7 @@ async function poll(){
     $('pwBanner').style.display=s.default_pw?'block':'none';
     const groups={};for(const d of DETAILS){(groups[d[0]]=groups[d[0]]||[]).push(`<tr><td>${d[2]}</td><td>${s[d[1]]}${d[3]?' '+d[3]:''}</td></tr>`)}
     $('details').innerHTML=Object.entries(groups).map(([g,r])=>`<table><tr><td colspan="2"><b>${g}</b></td></tr>${r.join('')}</table>`).join('');
-    $('foot').textContent=`Uptime ${dur(s.uptime)} · free heap ${(s.free_heap/1024).toFixed(0)} kB · last reset: ${s.reset_reason} · MQTT connects ${s.mqtt_reconnects} · WiFi reconnects ${s.wifi_reconnects}`;
+    $('foot').textContent=`Uptime ${dur(s.uptime)} · free heap ${(s.free_heap/1024).toFixed(0)} kB · last reset: ${s.reset_reason}${s.crash_stage&&s.crash_stage!=='-'?' (in '+s.crash_stage+')':''} · MQTT connects ${s.mqtt_reconnects} · WiFi reconnects ${s.wifi_reconnects}`;
   }catch(e){if(++failCount>1)$('offBanner').style.display='block'}
 }
 async function loadHist(){try{const r=await fetch('/api/history',{cache:'no-store'});hist=await r.json();hist.t=Date.now();drawAll()}catch(e){}}

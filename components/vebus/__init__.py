@@ -24,7 +24,7 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Required(CONF_RX_PIN): cv.int_,
         cv.Required(CONF_TX_PIN): cv.int_,
         cv.Required(CONF_DE_PIN): cv.int_,
-        cv.Optional(CONF_CORE, default=0): cv.int_range(0, 1),
+        cv.Optional(CONF_CORE, default=1): cv.int_range(0, 1),
         cv.Optional(CONF_INITIAL_ESS_POWER, default=0): cv.int_range(-1875, 1875),
         cv.Optional(CONF_VIRTUAL_MODE_INITIAL, default=False): cv.boolean,
         cv.Optional(CONF_VIRTUAL_MODE_DEADBAND, default=10): cv.int_range(0, 1000),

@@ -1,6 +1,10 @@
 #include "VEBusDriver.h"
 
-#define TX_DELAY_MS 8  // ms after sync before transmitting (matches original)
+// Our transmit slot after a sync frame: not before TX_DELAY_US and not later
+// than TX_DELAY_US + TX_WINDOW_US. A task that is late (preempted, flash
+// write) skips this sync instead of colliding with other bus traffic.
+#define TX_DELAY_US   8000
+#define TX_WINDOW_US  1500
 
 // -----------------------------------------------------------------------
 // Constructor
@@ -10,7 +14,7 @@ VEBus::VEBus()
       _frp(0), _frlen(0), _frameNr(0),
       _lastSentType(VEBUS_CMD_READ_RAM),
       _syncrxed(false), _nosync(false), _gotMP2data(false), _acked(false),
-      _synctime(0), _chksmfault(0),
+      _synctime(0), _syncUs(0), _txEnabled(true), _chksmfault(0),
       _multiplusTemp(0.0f), _multiplusDcCurrent(0.0f),
       _multiplusStatus80(0), _multiplusDcLevelAllowsInverting(false),
       _masterMultiLED_LEDon(0), _masterMultiLED_LEDblink(0),
@@ -21,7 +25,7 @@ VEBus::VEBus()
       _masterMultiLED_SwitchRegister(0),
       _BatVolt(0.0f), _ACPower(0),
       _virtualMode(false), _virtualSetpoint(0), _lastACOutLoad(0),
-      _lastSentEffective(0), _deadband(10),
+      _lastSentEffective(0), _essPending(false), _essPendingPower(0), _deadband(10),
       _gotRAMVars(false), _ramVarCount(0),
       _gotSetting(false), _settingId(0), _settingValue(0),
       _settingWriteAcked(false),
@@ -32,6 +36,9 @@ VEBus::VEBus()
 {
     memset((void *)_ramVarIds, 0, sizeof(_ramVarIds));
     memset((void *)_ramVarValues, 0, sizeof(_ramVarValues));
+    memset(_respLog, 0, sizeof(_respLog));
+    memset(_respLogLen, 0, sizeof(_respLogLen));
+    _respLogHead = 0;
 }
 
 // -----------------------------------------------------------------------
@@ -45,8 +52,20 @@ void VEBus::begin(int rxPin, int txPin, int dePin, int core)
 
     _cmdQueue = xQueueCreate(8, sizeof(VEBusCmd));
 
+    // UART first: TX goes to its idle (high) level before anyone enables
+    // the RS485 transceiver.
+    Serial1.begin(256000, SERIAL_8N1, _rxPin, _txPin);
+    Serial1.setPins(-1, -1, -1, _dePin);
+    Serial1.setMode(UART_MODE_RS485_HALF_DUPLEX);
+
     xTaskCreatePinnedToCore(
-        _taskEntry, "VEBus", 4096, this, 2, &_taskHandle, core);
+        _taskEntry, "VEBus", 4096, this, 5, &_taskHandle, core);
+}
+
+void VEBus::setTxEnabled(bool enable)
+{
+    _txEnabled = enable;
+    if (!enable) Serial1.flush();       // let a frame already in the FIFO finish
 }
 
 // -----------------------------------------------------------------------
@@ -57,7 +76,7 @@ void VEBus::setESSPower(int16_t watts)
 {
     _virtualSetpoint = watts;
     int16_t effective = _virtualMode ? (int16_t)(watts - _lastACOutLoad) : watts;
-    _queueESSPower(effective, true);
+    _queueESSPower(effective);
 }
 
 void VEBus::enableVirtualSetpointMode(bool enable, int16_t deadbandWatts)
@@ -67,7 +86,7 @@ void VEBus::enableVirtualSetpointMode(bool enable, int16_t deadbandWatts)
     _deadband = deadbandWatts;
     int16_t effective = enable ? (int16_t)(_virtualSetpoint - _lastACOutLoad)
                                : _virtualSetpoint;
-    _queueESSPower(effective, true);
+    _queueESSPower(effective);
 }
 
 void VEBus::setACOutLoad(int16_t watts)
@@ -78,17 +97,17 @@ void VEBus::setACOutLoad(int16_t watts)
     int16_t diff = (int16_t)(effective - _lastSentEffective);
     if (diff < 0) diff = (int16_t)-diff;
     if (diff >= _deadband) {
-        _queueESSPower(effective, false);
+        _queueESSPower(effective);
     }
 }
 
-void VEBus::_queueESSPower(int16_t effective, bool resetQueue)
+// The ESS setpoint lives in its own slot instead of the queue: the newest
+// value always wins and other queued requests (reads, version, info) are
+// never discarded to make room for it.
+void VEBus::_queueESSPower(int16_t effective)
 {
-    VEBusCmd cmd;
-    cmd.type = VEBUS_CMD_ESS_POWER;
-    cmd.power = effective;
-    if (resetQueue) xQueueReset(_cmdQueue);
-    xQueueSend(_cmdQueue, &cmd, 0);
+    _essPendingPower = effective;
+    _essPending = true;
     _lastSentEffective = effective;
 }
 
@@ -201,6 +220,15 @@ void VEBus::requestRAMVarInfo(uint8_t id)
     xQueueSend(_cmdQueue, &cmd, 0);
 }
 
+uint8_t VEBus::getResponseLog(uint8_t index, uint8_t *out, uint8_t maxLen) const
+{
+    if (index >= VEBUS_RESP_LOG) return 0;
+    uint8_t slot = (_respLogHead + index) % VEBUS_RESP_LOG;
+    uint8_t n = _respLogLen[slot] < maxLen ? _respLogLen[slot] : maxLen;
+    memcpy(out, _respLog[slot], n);
+    return n;
+}
+
 int16_t VEBus::getRAMVarValue(uint8_t index) const
 {
     if (index >= _ramVarCount) return 0;
@@ -223,10 +251,6 @@ void VEBus::_taskEntry(void *param)
 
 void VEBus::_run()
 {
-    Serial1.begin(256000, SERIAL_8N1, _rxPin, _txPin);
-    Serial1.setPins(-1, -1, -1, _dePin);
-    Serial1.setMode(UART_MODE_RS485_HALF_DUPLEX);
-
     while (true)
     {
         _processRx();
@@ -234,19 +258,28 @@ void VEBus::_run()
         if (_syncrxed)
         {
             _nosync = false;
-            VEBusCmd cmd;
-            if (xQueuePeek(_cmdQueue, &cmd, 0) == pdTRUE)
+            uint32_t sinceSync = micros() - _syncUs;
+            bool pending = _essPending || uxQueueMessagesWaiting(_cmdQueue) > 0;
+
+            if (!_txEnabled || !pending || sinceSync > TX_DELAY_US + TX_WINDOW_US)
             {
-                if ((uint32_t)(millis() - _synctime) > TX_DELAY_MS)
-                {
-                    _syncrxed = false;
-                    xQueueReceive(_cmdQueue, &cmd, 0);
-                    _sendCommand(cmd);
-                }
+                _syncrxed = false;              // nothing to do / slot missed
             }
-            else
+            else if (sinceSync >= TX_DELAY_US)
             {
                 _syncrxed = false;
+                VEBusCmd cmd;
+                if (_essPending)
+                {
+                    _essPending = false;
+                    cmd.type = VEBUS_CMD_ESS_POWER;
+                    cmd.power = _essPendingPower;
+                    _sendCommand(cmd);
+                }
+                else if (xQueueReceive(_cmdQueue, &cmd, 0) == pdTRUE)
+                {
+                    _sendCommand(cmd);
+                }
             }
         }
 
@@ -275,7 +308,7 @@ void VEBus::_processRx()
         _frbuf1[_frp++] = c;
 
         if (c == 0x55) {
-            if (_frp == 5) _synctime = millis();
+            if (_frp == 5) { _synctime = millis(); _syncUs = micros(); }
         }
 
         if ((uint8_t)c == 0xFF)
@@ -503,6 +536,7 @@ int VEBus::_prepareGetRAMVarInfo(char *out, uint8_t id, byte fn)
     byte j = _winmonHeader(out, fn);
     out[j++] = VEBUS_WCMD_GET_RAMVAR_INFO;
     out[j++] = id;
+    out[j++] = 0x00;               // id high byte
     return j;
 }
 
@@ -623,6 +657,15 @@ void VEBus::_decodeFrame(const char *frame, int len)
     // Frame 0x00: Winmon command responses
     // -------------------------------------------------------------------
     case 0x00:
+        // Diagnostics: keep the last few responses (without checksum + 0xFF)
+        {
+            uint8_t slot = _respLogHead;
+            uint8_t n = 0;
+            for (int i = 5; i < len - 2 && n < sizeof(_respLog[0]); i++)
+                _respLog[slot][n++] = (uint8_t)frame[i];
+            _respLogLen[slot] = n;
+            _respLogHead = (slot + 1) % VEBUS_RESP_LOG;
+        }
         if (frame[5] == (char)0xE6)
         {
             byte respCode = (byte)frame[6];
@@ -722,6 +765,12 @@ void VEBus::_decodeFrame(const char *frame, int len)
             // --- RAM var info responses (0x8E-0x8F) ---
             case VEBUS_WRESP_RAMVAR_SCALE:
                 _ramVarInfoScale = (int16_t)(256 * (uint8_t)frame[8] + (uint8_t)frame[7]);
+                // Scale and offset normally arrive in one frame: 8E sc sc 8F of of
+                if (len > 11 && (byte)frame[9] == VEBUS_WRESP_RAMVAR_OFFSET)
+                {
+                    _ramVarInfoOffset = (int16_t)(256 * (uint8_t)frame[11] + (uint8_t)frame[10]);
+                    _gotRAMVarInfo = true;
+                }
                 break;
             case VEBUS_WRESP_RAMVAR_OFFSET:
                 _ramVarInfoOffset = (int16_t)(256 * (uint8_t)frame[8] + (uint8_t)frame[7]);
