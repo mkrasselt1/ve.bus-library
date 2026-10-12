@@ -455,8 +455,8 @@ static void publishState()
 
 // =======================================================================
 // HA MQTT auto-discovery — one entity per loop() pass so a slow broker
-// never blocks the web UI. Unique ids match earlier versions of this
-// example so existing HA entities are kept.
+// never blocks the web UI. With the default device id the unique ids match
+// earlier versions of this example so existing HA entities are kept.
 // =======================================================================
 struct Entity {
     const char *comp;     // HA component
@@ -528,7 +528,10 @@ static const uint8_t ENTITY_COUNT = sizeof(ENTITIES) / sizeof(ENTITIES[0]);
 static bool publishEntity(const Entity &e)
 {
     char uid[64], ct[128];
-    if (e.devUid) snprintf(uid, sizeof(uid), "%s_%s", cfg.deviceId, e.uid);
+    // Legacy un-prefixed ids are only kept for the default device id; any
+    // other id gets prefixed so several boards don't share one HA entity.
+    if (e.devUid || strcmp(cfg.deviceId, DEFAULT_DEVICE_ID))
+        snprintf(uid, sizeof(uid), "%s_%s", cfg.deviceId, e.uid);
     else          strlcpy(uid, e.uid, sizeof(uid));
     snprintf(ct, sizeof(ct), "homeassistant/%s/%s/config", e.comp, uid);
 
