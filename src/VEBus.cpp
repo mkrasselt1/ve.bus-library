@@ -176,6 +176,15 @@ void VEBus::writeSetting(uint8_t id, uint16_t value)
     xQueueSend(_cmdQueue, &cmd, 0);
 }
 
+void VEBus::writeSettingRAM(uint8_t id, uint16_t value)
+{
+    VEBusCmd cmd;
+    cmd.type = VEBUS_CMD_WRITE_SETTING_RAM;
+    cmd.setting.id = id;
+    cmd.setting.value = value;
+    xQueueSend(_cmdQueue, &cmd, 0);
+}
+
 void VEBus::requestDeviceState()
 {
     VEBusCmd cmd;
@@ -382,6 +391,10 @@ void VEBus::_sendCommand(const VEBusCmd &cmd)
         // flags: bit0=1 (setting), bit1=0 (write to RAM+EEPROM)
         len = _prepareWriteViaID(_txbuf1, 0x01, cmd.setting.id, cmd.setting.value, fn);
         break;
+    case VEBUS_CMD_WRITE_SETTING_RAM:
+        // flags: bit0=1 (setting), bit1=1 (RAM only, no EEPROM)
+        len = _prepareWriteViaID(_txbuf1, 0x03, cmd.setting.id, cmd.setting.value, fn);
+        break;
     case VEBUS_CMD_WRITE_RAM_VAR:
         // flags: bit0=0 (RAM var), bit1=1 (RAM only, no EEPROM)
         len = _prepareWriteViaID(_txbuf1, 0x02, cmd.setting.id, cmd.setting.value, fn);
@@ -494,6 +507,7 @@ int VEBus::_prepareReadSetting(char *out, uint8_t id, byte fn)
     byte j = _winmonHeader(out, fn);
     out[j++] = VEBUS_WCMD_READ_SETTING;
     out[j++] = id;
+    out[j++] = 0x00;               // id high byte
     return j;
 }
 
@@ -528,6 +542,7 @@ int VEBus::_prepareGetSettingInfo(char *out, uint8_t id, byte fn)
     byte j = _winmonHeader(out, fn);
     out[j++] = VEBUS_WCMD_GET_SETTING_INFO;
     out[j++] = id;
+    out[j++] = 0x00;               // id high byte
     return j;
 }
 
@@ -738,6 +753,17 @@ void VEBus::_decodeFrame(const char *frame, int len)
             // --- Setting info responses (0x89-0x8D) ---
             case VEBUS_WRESP_SETTING_SCALE:
                 _settingInfo.scale = (int16_t)(256 * (uint8_t)frame[8] + (uint8_t)frame[7]);
+                // Long Winmon frame: 89 sc sc of of def def min min max max [access]
+                if (len - 2 > 16)
+                {
+                    _settingInfo.offset       = (int16_t)(256 * (uint8_t)frame[10] + (uint8_t)frame[9]);
+                    _settingInfo.defaultValue = (uint16_t)(256 * (uint8_t)frame[12] + (uint8_t)frame[11]);
+                    _settingInfo.minimum      = (uint16_t)(256 * (uint8_t)frame[14] + (uint8_t)frame[13]);
+                    _settingInfo.maximum      = (uint16_t)(256 * (uint8_t)frame[16] + (uint8_t)frame[15]);
+                    _settingInfo.receivedFields = 0x1F;
+                    _gotSettingInfo = true;
+                    break;
+                }
                 _settingInfo.receivedFields |= 0x01;
                 if (_settingInfo.receivedFields == 0x1F) _gotSettingInfo = true;
                 break;

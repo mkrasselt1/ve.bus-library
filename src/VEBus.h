@@ -191,6 +191,7 @@ enum VEBusCmdType : uint8_t {
     VEBUS_CMD_SET_SWITCH      = 13,  // Set switch state (on/off/charger/inverter)
     VEBUS_CMD_GET_SETTING_INFO = 14, // Get setting info (scale/offset/default/min/max)
     VEBUS_CMD_GET_RAMVAR_INFO  = 15, // Get RAM var info (scale/offset)
+    VEBUS_CMD_WRITE_SETTING_RAM = 16, // Write a setting to RAM only (no EEPROM)
 };
 
 // Maximum number of RAM variables per read request
@@ -340,6 +341,10 @@ public:
     // --- Setting read/write ---
     void readSetting(uint8_t id);
     void writeSetting(uint8_t id, uint16_t value);
+    // RAM only, no EEPROM write: for values changed often (e.g. the AC input
+    // current limit). The device falls back to the stored value after a reset.
+    // Needs VE.Bus firmware >= 412.
+    void writeSettingRAM(uint8_t id, uint16_t value);
 
     // --- Device state ---
     void requestDeviceState();
@@ -513,7 +518,7 @@ private:
     volatile int16_t _virtualSetpoint;
     volatile int16_t _lastACOutLoad;
     volatile int16_t _lastSentEffective;
-    uint8_t          _respLog[8][12];
+    uint8_t          _respLog[8][18];
     uint8_t          _respLogLen[8];
     volatile uint8_t _respLogHead;
     volatile bool    _essPending;          // latest ESS setpoint waiting for TX

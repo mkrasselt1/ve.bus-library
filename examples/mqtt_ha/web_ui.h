@@ -179,6 +179,7 @@ static const char ADMIN_HTML[] PROGMEM = R"rawliteral(<!doctype html>
 <section class="card"><h2>Control</h2>
 <div class="grid2">
 <label class="f">ESS setpoint (W, −1875…1875, negative = feed-in)<span class="row"><input type="number" id="ess" min="-1875" max="1875" step="1" style="width:120px"><button class="primary" onclick="cmd('ess_power',$('ess').value)">Set</button></span></label>
+<label class="f">AC input current limit (A, RAM only — the stored value returns after a Multiplus restart)<span class="row"><input type="number" id="acl" min="0" max="100" step="0.1" style="width:120px"><button class="primary" onclick="cmd('ac_in_limit',$('acl').value)">Set</button><button onclick="confirm('Store the active AC input limit permanently in the Multiplus (EEPROM)?')&&cmd('ac_in_limit_save')">Save permanently</button></span></label>
 <label class="f">Switch state<span class="row"><select id="sw"><option value="on">On</option><option value="off">Off</option><option value="charger_only">Charger only</option><option value="inverter_only">Inverter only</option></select><button onclick="cmd('switch_state',$('sw').value)">Apply</button></span></label>
 <label class="f">Battery-neutral UPS mode<span class="row"><select id="vm"><option value="OFF">Off</option><option value="ON">On</option></select><button onclick="cmd('virtual_mode',$('vm').value)">Apply</button></span></label>
 </div>
@@ -232,8 +233,9 @@ async function post(url,body){const r=await fetch(url,{method:'POST',body:new UR
 async function cmd(c,v){try{await post('/admin/api/control',{cmd:c,value:v??''});toast('Sent: '+c.replace('_',' '));setTimeout(state,1500)}catch(e){toast('Error: '+e.message)}}
 async function state(){try{const s=await (await fetch('/api/state',{cache:'no-store'})).json();
   $('sub').textContent=`${s.device_id} · ${s.ip}`;$('pwBanner').style.display=s.default_pw?'block':'none';
-  $('ctlState').textContent=`Current: setpoint ${s.ess_power} W (effective ${s.ess_power_eff} W) · switch ${s.switch_state} · battery-neutral ${s.virtual_mode} · state ${s.device_state}`;
+  $('ctlState').textContent=`Current: setpoint ${s.ess_power} W (effective ${s.ess_power_eff} W) · switch ${s.switch_state} · battery-neutral ${s.virtual_mode} · state ${s.device_state} · AC limit ${s.ac_in_actual} A${s.ac_in_limit_unsaved==='ON'?' (not saved)':''}`;
   if(document.activeElement!==$('ess')&&$('ess').value==='')$('ess').value=s.ess_power;
+  if(document.activeElement!==$('acl')&&$('acl').value==='')$('acl').value=s.ac_in_actual;
   $('sw').value=s.switch_state;$('vm').value=s.virtual_mode;
   $('sys').textContent=`Uptime ${Math.floor(s.uptime/3600)} h · free heap ${(s.free_heap/1024).toFixed(0)} kB · last reset: ${s.reset_reason} · WiFi ${s.rssi} dBm`}catch(e){}}
 async function loadCfg(){const c=await (await fetch('/admin/api/config',{cache:'no-store'})).json();const f=$('cfg');

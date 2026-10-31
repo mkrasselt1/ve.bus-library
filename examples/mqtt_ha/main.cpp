@@ -76,6 +76,7 @@
 #define STATE_OFFSET_MS      3000   // device state request
 #define MQTT_RECONNECT_MS    5000
 #define WAKEUP_RETRY_MS      3000
+#define LIMIT_INFO_RETRY_MS 10000   // ask for the input current limit range
 
 // Robustness
 #define WDT_TIMEOUT_S          30        // main loop must check in this often
@@ -139,6 +140,16 @@ uint32_t g_restartAtMs    = 0;
 bool     g_otaAuthed      = false;
 bool     g_essDirty       = false;   // ESS setpoint / virtual mode not yet in NVS
 uint32_t g_essSavedMs     = 0;
+
+// AC input current limit (setting 6): scale, offset and range are read from
+// the Multiplus once; until then the limit cannot be set.
+bool     g_limInfo        = false;
+float    g_limScale       = 0;
+int16_t  g_limOffset      = 0;
+uint16_t g_limMinRaw      = 0;
+uint16_t g_limMaxRaw      = 0;
+float    g_limSet         = -1;      // last limit sent (A), -1 = none
+bool     g_limUnsaved     = false;   // RAM limit differs from the stored one
 
 // Breadcrumb: which part of loop() was running. Survives a watchdog reset
 // (RTC memory) so the dashboard can show where the firmware got stuck.
@@ -377,6 +388,47 @@ static bool handleCommand(const char *cmd, const char *arg, const char *src)
         vebus.enableVirtualSetpointMode(on);
         Serial.printf("[%s] Virtual mode → %s\n", src, on ? "ON" : "OFF");
     }
+    else if (!strcmp(cmd, "ac_in_limit")) {
+        if (!g_limInfo) {
+            Serial.printf("[%s] AC input limit: range not read from the Multiplus yet\n", src);
+            return false;
+        }
+        float lo  = g_limScale * (float)(g_limMinRaw + g_limOffset);
+        float hi  = g_limScale * (float)(g_limMaxRaw + g_limOffset);
+        float dev = vebus.getMaxInputCurrentLimit();      // hardware maximum
+        if (dev > 0 && dev < hi) hi = dev;
+        float a = constrain((float)atof(arg), lo, hi);
+        long raw = lroundf(a / g_limScale) - g_limOffset;
+        // Only write when it differs from the limit the Multiplus reports
+        if (fabsf(a - vebus.getActInputCurrentLimit()) < g_limScale / 2) {
+            Serial.printf("[%s] AC input limit already %.1f A — not written\n", src, a);
+            g_publishNow = true;
+            return true;
+        }
+        // RAM only: no EEPROM wear, the stored limit returns after a reset
+        vebus.writeSettingRAM(VEBUS_SETTING_IMAINS_LIMIT, (uint16_t)raw);
+        g_limSet = a;
+        g_limUnsaved = true;
+        Serial.printf("[%s] AC input limit → %.1f A (raw %ld)\n", src, a, raw);
+    }
+    else if (!strcmp(cmd, "ac_in_limit_save")) {
+        // Store the active limit in EEPROM — only after a RAM change, so a
+        // stray button press never causes an EEPROM write.
+        if (!g_limInfo || vebus.hasNoSync()) {
+            Serial.printf("[%s] AC input limit save: Multiplus not ready\n", src);
+            return false;
+        }
+        if (!g_limUnsaved) {
+            Serial.printf("[%s] AC input limit unchanged — not saved\n", src);
+            g_publishNow = true;
+            return true;
+        }
+        float a  = vebus.getActInputCurrentLimit();
+        long raw = lroundf(a / g_limScale) - g_limOffset;
+        vebus.writeSetting(VEBUS_SETTING_IMAINS_LIMIT, (uint16_t)raw);
+        g_limUnsaved = false;
+        Serial.printf("[%s] AC input limit %.1f A saved permanently (raw %ld)\n", src, a, raw);
+    }
     else if (!strcmp(cmd, "wakeup"))           vebus.setSwitchState(VEBUS_SWITCH_STATE_ON);
     else if (!strcmp(cmd, "sleep"))            vebus.setSwitchState(VEBUS_SWITCH_STATE_OFF);
     else if (!strcmp(cmd, "force_absorption")) vebus.forceDeviceState(VEBUS_FORCE_ABSORPTION);
@@ -384,7 +436,8 @@ static bool handleCommand(const char *cmd, const char *arg, const char *src)
     else if (!strcmp(cmd, "force_equalise"))   vebus.forceDeviceState(VEBUS_FORCE_EQUALISE);
     else return false;
 
-    if (strcmp(cmd, "ess_power") && strcmp(cmd, "switch_state") && strcmp(cmd, "virtual_mode"))
+    if (strcmp(cmd, "ess_power") && strcmp(cmd, "switch_state") && strcmp(cmd, "virtual_mode") &&
+        strcmp(cmd, "ac_in_limit") && strcmp(cmd, "ac_in_limit_save"))
         Serial.printf("[%s] %s sent\n", src, cmd);
     g_publishNow = true;
     return true;
@@ -424,10 +477,11 @@ static void buildStateJson(Buf &j)
     if (live.mainsHz > 0) j.add("\"mains_freq\":%.2f,", live.mainsHz); else j.add("\"mains_freq\":null,");
     if (live.invHz > 0)   j.add("\"inv_freq\":%.2f,", live.invHz);     else j.add("\"inv_freq\":null,");
     j.add("\"led_on\":%u,\"led_blink\":%u,\"ac_in_min\":%.1f,\"ac_in_max\":%.1f,"
-          "\"ac_in_actual\":%.1f,\"ac_in_config\":%u,",
+          "\"ac_in_actual\":%.1f,\"ac_in_config\":%u,\"ac_in_limit_unsaved\":\"%s\",",
           (unsigned)vebus.getLEDon(), (unsigned)vebus.getLEDblink(),
           vebus.getMinInputCurrentLimit(), vebus.getMaxInputCurrentLimit(),
-          vebus.getActInputCurrentLimit(), (unsigned)vebus.getAcInputConfiguration());
+          vebus.getActInputCurrentLimit(), (unsigned)vebus.getAcInputConfiguration(),
+          g_limUnsaved ? "ON" : "OFF");
     j.add("\"device_state\":\"%s\",\"charge_sub_state\":\"%s\",\"checksum_faults\":%lu,",
           g_devState < 0 ? "Unknown" : deviceStateName(g_devState),
           g_devState == VEBUS_STATE_CHARGE ? chargeSubStateName(g_devSubState) : "N/A",
@@ -516,6 +570,10 @@ static const Entity ENTITIES[] = {
         "\"min\":-1875,\"max\":1875,\"step\":1,\"unit_of_meas\":\"W\",\"mode\":\"box\""},
     {"select", "switch",           true,  "Switch State",       "switch_state", "switch_state",
         "\"options\":[\"on\",\"off\",\"charger_only\",\"inverter_only\"]"},
+    {"number", "vebus_ac_in_limit", false, "AC Input Current Limit", "ac_in_actual", "ac_in_limit",
+        "\"min\":0,\"max\":100,\"step\":0.1,\"unit_of_meas\":\"A\",\"dev_cla\":\"current\",\"mode\":\"box\""},
+    {"button", "vebus_ac_in_limit_save", false, "Save AC Input Limit Permanently", nullptr, "ac_in_limit_save", ""},
+    {"binary_sensor", "vebus_ac_in_limit_unsaved", false, "AC Input Limit Not Saved", "ac_in_limit_unsaved", nullptr, ""},
     {"switch", "vebus_virtual_mode", false, "Battery-Neutral UPS Mode", "virtual_mode", "virtual_mode", ""},
     {"button", "vebus_wakeup",      false, "Wakeup Multiplus", nullptr, "wakeup",           ""},
     {"button", "vebus_sleep",       false, "Sleep Multiplus",  nullptr, "sleep",            ""},
@@ -784,7 +842,7 @@ static void handleDebug()
     Buf j(payloadBuf, sizeof(payloadBuf));
     j.add("{\"responses\":[");
     for (uint8_t i = 0; i < VEBus::VEBUS_RESP_LOG; i++) {
-        uint8_t b[12];
+        uint8_t b[18];
         uint8_t n = vebus.getResponseLog(i, b, sizeof(b));
         j.add(i ? ",\"" : "\"");
         for (uint8_t k = 0; k < n; k++) j.add("%02X", b[k]);
@@ -796,7 +854,11 @@ static void handleDebug()
         j.add("%s\"%u\":[%g,%d,%d,%d]", id ? "," : "", id, vi.scale, vi.offset,
               vi.isSigned, scaler.fromDevice(id));
     }
-    j.add("},\"scaler_done\":%s}", scaler.complete() ? "true" : "false");
+    j.add("},\"scaler_done\":%s,", scaler.complete() ? "true" : "false");
+    j.add("\"ac_limit\":{\"info\":%s,\"scale\":%g,\"offset\":%d,\"min_raw\":%u,\"max_raw\":%u,"
+          "\"set\":%.1f,\"actual\":%.1f}}",
+          g_limInfo ? "true" : "false", g_limScale, g_limOffset, g_limMinRaw, g_limMaxRaw,
+          g_limSet, vebus.getActInputCurrentLimit());
     sendJson(payloadBuf);
 }
 
@@ -1227,6 +1289,33 @@ void loop()
         g_devSubState = vebus.getDeviceSubState();
         ups.data.deviceState = g_devState;
         vebus.clearDeviceStateResponse();
+    }
+
+    // AC input current limit: read scale/offset/range once after sync
+    static uint32_t lastLimInfoMs = 0;
+    if (!g_limInfo && !vebus.hasNoSync() &&
+        (!lastLimInfoMs || now - lastLimInfoMs >= LIMIT_INFO_RETRY_MS))
+    {
+        lastLimInfoMs = now;
+        vebus.requestSettingInfo(VEBUS_SETTING_IMAINS_LIMIT);
+    }
+    if (vebus.hasSettingInfoResponse())
+    {
+        const VEBusSettingInfo &si = vebus.getSettingInfo();
+        float sc = si.scale > 0 ? (float)si.scale : si.scale < 0 ? 1.0f / (float)-si.scale : 0;
+        // Plausibility: a current limit is scaled 0.001..1 A per step
+        if (si.id == VEBUS_SETTING_IMAINS_LIMIT && sc >= 0.001f && sc <= 1.0f &&
+            si.maximum > si.minimum)
+        {
+            g_limScale  = sc;
+            g_limOffset = si.offset;
+            g_limMinRaw = si.minimum;
+            g_limMaxRaw = si.maximum;
+            g_limInfo   = true;
+            Serial.printf("[app] AC input limit range %.1f..%.1f A (scale %g)\n",
+                          sc * (si.minimum + si.offset), sc * (si.maximum + si.offset), sc);
+        }
+        vebus.clearSettingInfoResponse();
     }
 
     if (vebus.hasVersionResponse())

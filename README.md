@@ -226,6 +226,10 @@ if (vebus.hasSettingResponse()) {
 
 // Write AC input current limit (setting ID 6)
 vebus.writeSetting(VEBUS_SETTING_IMAINS_LIMIT, 160);  // 16.0 A
+
+// Same, but RAM only (no EEPROM wear) - for values changed often.
+// The Multiplus returns to the stored value after a reset.
+vebus.writeSettingRAM(VEBUS_SETTING_IMAINS_LIMIT, 60);  // 6.0 A
 ```
 
 ### Device state and switch control
@@ -311,7 +315,7 @@ a web admin password. Values are persisted to NVS.
 | Page | Access | Content |
 |------|--------|---------|
 | `/` | public, read-only | live values, VE.Bus/MQTT/WiFi status, 1 h / 6 h / 24 h charts (power, battery voltage, SoC; 1-minute averages kept in RAM) |
-| `/admin/` | HTTP basic auth, user `admin`, default password `vebus` | ESS setpoint, switch state, battery-neutral mode, charge buttons, MQTT settings, ESS fail-safe timeout, NUT/apcupsd settings (UPS name, credentials, low-battery SoC, nominal power, battery capacity), admin password, OTA firmware upload, reboot, WiFi reset |
+| `/admin/` | HTTP basic auth, user `admin`, default password `vebus` | ESS setpoint, AC input current limit, switch state, battery-neutral mode, charge buttons, MQTT settings, ESS fail-safe timeout, NUT/apcupsd settings (UPS name, credentials, low-battery SoC, nominal power, battery capacity), admin password, OTA firmware upload, reboot, WiFi reset |
 
 Change the default password — the dashboard shows a warning until you do.
 JSON endpoints: `/api/state`, `/api/history`, and `/admin/api/debug`
@@ -377,6 +381,13 @@ it, apcupsd slaves decide on `BCHARGE` and the `LOWBATT` flag only.
   publishes — far less blocking on a slow WiFi link.
 - Optional ESS fail-safe: if no new setpoint arrives within N seconds the
   setpoint returns to 0 W.
+- AC input current limit (HA number, `<prefix>/ac_in_limit/set`, admin page):
+  range and scale are read from the Multiplus first; the value is written to
+  RAM only (no EEPROM wear) and only when it differs from the limit the
+  Multiplus reports. After a Multiplus restart its stored limit applies again.
+  The button "Save AC Input Limit Permanently" (`<prefix>/ac_in_limit_save/set`)
+  writes the active limit to EEPROM — only if it was changed since the last
+  save; the binary sensor "AC Input Limit Not Saved" shows a pending change.
 - The last reset reason (power-on, watchdog, brownout, …) is shown on the
   dashboard and in the serial log; after a watchdog reset or crash the
   dashboard also names the part of the firmware that was running ("in mqtt",
@@ -605,6 +616,13 @@ void clearSettingWriteAcked();
 ```
 
 Writes to both RAM and EEPROM (persistent across power cycles).
+
+```cpp
+void writeSettingRAM(uint8_t id, uint16_t value);
+```
+
+Writes to RAM only (CommandWriteViaID flags 0x03, VE.Bus firmware >= 412):
+no EEPROM wear, the stored value is used again after a reset of the device.
 
 ### Switch State
 
